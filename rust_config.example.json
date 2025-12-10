@@ -1,0 +1,24 @@
+{
+  "server_ip": "0",
+  "server_port": 0,
+  "player_id": "0",
+  "player_token": "0",
+
+  "entities": {
+    "sam_main": 0,
+    "sam_secondary": 0,
+    "tc_main": 0,
+    "tcm_ext_n": 0,
+    "tcm_ext_ne": 0,
+    "tcm_ext_e": 0,
+    "tcm_ext_se": 0,
+    "tcm_ext_s": 0,
+    "tcm_ext_sw": 0,
+    "tcm_ext_w": 0,
+    "tcm_ext_nw": 0,
+    "turret_front": 0,
+    "switch_hq": 0
+  },
+
+  "f1_connect": "client.connect "
+}

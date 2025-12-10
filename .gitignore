@@ -1,0 +1,23 @@
+# venv
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Secrets / local configs
+.env
+*.env
+rust_config.
+rust_config.json
+rustplus.config.json
+rustplus.local.json
+token.js  # ONLY if you're worried about this; not required, it's safe code-only
+raid_alert.py
+
+# Logs
+*.log
+logs/
