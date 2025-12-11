@@ -428,9 +428,12 @@ BOT_PREFIX = os.getenv("BOT_PREFIX", "!")
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    guild = discord.Object(id=DISCORD_GUILD_ID)
-    await bot.tree.sync(guild=guild)
-    print("Guild slash commands synced.")
+
+    try:
+        synced = await bot.tree.sync()  # sync GLOBAL commands
+        print(f"✅ Synced {len(synced)} global application commands.")
+    except Exception as e:
+        print("Error syncing global commands:", e)
 
 
 # -------------------------
