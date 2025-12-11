@@ -982,6 +982,70 @@ async def tc_status(interaction: discord.Interaction, tc_name: str = "tc_main"):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+@tree.command(description="Open the HQ command console for leadership.")
+@app_commands.describe(
+    base_name="Base name used in alerts and status (default: Main)."
+)
+async def hq(interaction: discord.Interaction, base_name: str = "Main"):
+    """Leadership-only HQ control panel."""
+    # Must be in a guild
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This command can only be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+
+    # Permissions – reuse same roles as connect management
+    allowed_role_ids = [
+        RUST_ROLE_LEADERSHIP_ID,
+        RUST_ROLE_RECRUITER_ID,
+        RUST_ROLE_EVENT_COORD_ID,
+    ]
+
+    try:
+        has_perm = user_has_any_role(interaction.user, allowed_role_ids)
+    except NameError:
+        # If helper is missing for some reason, fall back to leadership only
+        allowed_role_ids = [RUST_ROLE_LEADERSHIP_ID]
+        has_perm = any(
+            (role.id in allowed_role_ids and role.id != 0)
+            for role in interaction.user.roles
+        )
+
+    if not has_perm:
+        await interaction.response.send_message(
+            "❌ You don't have permission to open the HQ console.",
+            ephemeral=True,
+        )
+        return
+
+    # Build a nice summary embed for context
+    desc_lines = [
+        f"**Base:** {base_name}",
+        "",
+        "🧭 **Sections:**",
+        "• 🚨 Alerts – open the raid/status alert panel",
+        "• 🌐 Connect – server connect menu (/connect)",
+        "• 🛰 SAM – control Main SAM via smart switch / Rust+",
+        "• 🔌 HQ – toggle HQ power",
+        "• 🏛 TC – check main TC upkeep / resources",
+    ]
+    embed = discord.Embed(
+        title="🛡 HQ Command Console",
+        description="\n".join(desc_lines),
+        color=discord.Color.dark_teal(),
+    )
+    embed.set_footer(text="Project Sisyphean — Stay alert, stay alive.")
+
+    view = HQView(base_name=base_name)
+    await interaction.response.send_message(
+        embed=embed,
+        view=view,
+        ephemeral=True,
+    )
+
+
 # ---------- INTERACTIVE MENU ----------
 
 class AlertMenuView(discord.ui.View):
@@ -1084,6 +1148,129 @@ async def menu(interaction: discord.Interaction, base_name: str = "Main"):
         view=view,
         ephemeral=True,
     )
+
+
+# ---------- HQ COMMAND CONSOLE ----------
+
+class HQView(discord.ui.View):
+    def __init__(self, base_name: str | None = None, timeout: float | None = 180.0):
+        super().__init__(timeout=timeout)
+        self.base_name = base_name or "Main"
+
+    # ---- ROW 1: PANELS ----
+
+    @discord.ui.button(label="Alert Panel", style=discord.ButtonStyle.danger, emoji="🚨")
+    async def open_alert_panel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        """Open the existing AlertMenuView for this base."""
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This only works inside a server.", ephemeral=True
+            )
+            return
+
+        view = AlertMenuView(base_name=self.base_name)
+        await interaction.response.send_message(
+            f"Alert panel for **{self.base_name}**.",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Connect Menu", style=discord.ButtonStyle.primary, emoji="🌐")
+    async def open_connect_menu(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        """Open the /connect dropdown menu as a view."""
+        # If connect system isn't configured for some reason, fail gracefully.
+        try:
+            # Needs CONNECT_PROFILES & ConnectMenuView from your existing connect system
+            if not CONNECT_PROFILES:
+                await interaction.response.send_message(
+                    "No connect profiles configured yet. Use `/connect_add` or `/connect_reload`.",
+                    ephemeral=True,
+                )
+                return
+
+            view = ConnectMenuView(CONNECT_PROFILES)
+        except NameError:
+            await interaction.response.send_message(
+                "Connect menu is not configured in this bot build.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "Select a server to get its F1 connect command:",
+            view=view,
+            ephemeral=True,
+        )
+
+    # ---- ROW 2: SAM CONTROLS ----
+
+    @discord.ui.button(label="MAIN SAM ON", style=discord.ButtonStyle.success, emoji="🛰")
+    async def sam_on_btn(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        # Uses your existing Rust+ helper
+        await handle_entity_action(interaction, "sam_main", "on")
+
+    @discord.ui.button(label="MAIN SAM OFF", style=discord.ButtonStyle.secondary, emoji="🛰")
+    async def sam_off_btn(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await handle_entity_action(interaction, "sam_main", "off")
+
+    @discord.ui.button(label="SAM Status", style=discord.ButtonStyle.secondary, emoji="ℹ️")
+    async def sam_status_btn(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await handle_entity_status(interaction, "sam_main")
+
+    # ---- ROW 3: HQ POWER + TC STATUS ----
+
+    @discord.ui.button(label="HQ ON", style=discord.ButtonStyle.success, emoji="🔌")
+    async def hq_on_btn(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await handle_entity_action(interaction, "switch_hq", "on")
+
+    @discord.ui.button(label="HQ OFF", style=discord.ButtonStyle.secondary, emoji="🔌")
+    async def hq_off_btn(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await handle_entity_action(interaction, "switch_hq", "off")
+
+    @discord.ui.button(label="HQ Status", style=discord.ButtonStyle.secondary, emoji="ℹ️")
+    async def hq_status_btn(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await handle_entity_status(interaction, "switch_hq", "status")
+
+    @discord.ui.button(label="TC Status", style=discord.ButtonStyle.primary, emoji="🏛")
+    async def tc_status_btn(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        # Reuse your tc_status helper (takes interaction + tc_name)
+        await tc_status(interaction, "tc_main")
 
 
 # ---------- ENTRY POINT ----------
