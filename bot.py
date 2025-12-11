@@ -427,20 +427,11 @@ BOT_PREFIX = os.getenv("BOT_PREFIX", "!")
 
 @bot.event
 async def on_ready():
-    logging.info(f"Logged in as {bot.user} (id={bot.user.id})")
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    guild = discord.Object(id=DISCORD_GUILD_ID)
+    await bot.tree.sync(guild=guild)
+    print("Guild slash commands synced.")
 
-    # Sync slash commands
-    try:
-        if RUST_GUILD_ID:
-            guild_obj = discord.Object(id=RUST_GUILD_ID)
-            tree.copy_global_to(guild=guild_obj)
-            synced = await tree.sync(guild=guild_obj)
-            logging.info(f"Synced {len(synced)} commands to guild {RUST_GUILD_ID}")
-        else:
-            synced = await tree.sync()
-            logging.info(f"Synced {len(synced)} global commands")
-    except Exception as e:
-        logging.exception("Failed to sync app commands: %s", e)
 
 # -------------------------
 # CONNECT MENU CONFIG
