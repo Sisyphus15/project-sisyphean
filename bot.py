@@ -499,22 +499,6 @@ async def ping(interaction: discord.Interaction):
     )
 
 
-# @tree.command(description="Show the F1 console connect command for this wipe.")
-# async def connect(interaction: discord.Interaction):
-#     if not F1_CONNECT:
-#         await interaction.response.send_message(
-#             "No F1 connect string configured yet. Ask staff to update `rust_config.json`.",
-#             ephemeral=True,
-#         )
-#         return
-
-#     await interaction.response.send_message(
-#         "Copy & paste this into your Rust F1 console:\n"
-#         f"```{F1_CONNECT}```",
-#         ephemeral=True,
-#     )
-
-
 @tree.command(description="Send a test raid alert to the raid channel.")
 @app_commands.describe(base_name="Name of the base to include in the message.")
 async def raid_test(interaction: discord.Interaction, base_name: str = "Main Base"):
@@ -625,52 +609,6 @@ async def connect_reload(interaction: discord.Interaction):
         )
 
     await interaction.response.send_message(msg, ephemeral=True)
-
-@tree.command(description="Reload the server connect profiles from connect_servers.json.")
-async def connect_reload(interaction: discord.Interaction):
-    # Must be in a guild
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message(
-            "This command can only be used in a server.",
-            ephemeral=True,
-        )
-        return
-
-    # Permission check – Leadership / Recruiter / Event Coordinator
-    allowed_role_ids = [
-        RUST_ROLE_LEADERSHIP_ID,
-        RUST_ROLE_RECRUITER_ID,
-        RUST_ROLE_EVENT_COORD_ID,
-    ]
-
-    if not user_has_any_role(interaction.user, allowed_role_ids):
-        await interaction.response.send_message(
-            "❌ You don't have permission to reload connect profiles.",
-            ephemeral=True,
-        )
-        return
-
-    # Try to reload profiles
-    try:
-        new_profiles, new_index = load_connect_profiles()
-    except Exception as e:
-        logging.exception("Error reloading connect profiles: %s", e)
-        await interaction.response.send_message(
-            f"❌ Failed to reload connect profiles: `{e}`",
-            ephemeral=True,
-        )
-        return
-
-    # Update globals
-    global CONNECT_PROFILES, CONNECT_PROFILE_INDEX
-    CONNECT_PROFILES = new_profiles
-    CONNECT_PROFILE_INDEX = new_index
-
-    count = len(CONNECT_PROFILES)
-    await interaction.response.send_message(
-        f"✅ Reloaded **{count}** connect profile(s) from config.",
-        ephemeral=True,
-    )
 
 
 # ---------- SAM & HQ SWITCH COMMANDS ----------
