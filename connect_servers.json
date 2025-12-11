@@ -1,0 +1,51 @@
+[
+  {
+    "key": "stev_eu_monday",
+    "label": "[EU] Stevious 2x Mondays | Vanilla",
+    "category": "Wipe",
+    "f1": "client.connect 80.244.15.10:28010",
+    "emoji": "🇪🇺",
+    "notes": "Primary EU Monday wipe server"
+  },
+  {
+    "key": "stev_us_monday",
+    "label": "[US] Stevious 2x Mondays | Vanilla",
+    "category": "Wipe",
+    "f1": "client.connect 205.234.243.9:28010",
+    "emoji": "🇺🇸",
+    "notes": "US Monday wipe server"
+  },
+  {
+    "key": "stev_eu_main",
+    "label": "[EU] Stevious 2x Main | Vanilla",
+    "category": "Main",
+    "f1": "client.connect 80.244.15.15:28010",
+    "emoji": "🇪🇺",
+    "notes": "EU Main server"
+  },
+  {
+    "key": "stev_us_main",
+    "label": "[US] Stevious 2x Main | Vanilla",
+    "category": "Main",
+    "f1": "client.connect 168.100.163.72:28010",
+    "emoji": "🇺🇸",
+    "notes": "US Main server"
+  },
+
+  {
+    "key": "train_build",
+    "label": "Build Training Map",
+    "category": "Training",
+    "f1": "client.connect 0.0.0.0:28015",
+    "emoji": "🏗️",
+    "notes": "Replace with your favorite build server IP"
+  },
+  {
+    "key": "train_pvp",
+    "label": "PvP Arena / Event Map",
+    "category": "Training",
+    "f1": "client.connect 0.0.0.0:28016",
+    "emoji": "⚔️",
+    "notes": "Replace with aim train / event server"
+  }
+]

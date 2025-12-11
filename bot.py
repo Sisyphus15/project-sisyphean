@@ -11,6 +11,8 @@ from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 import aiohttp
+import json
+
 
 # ---------- ENV + CONFIG + LOGGING ----------
 
@@ -36,6 +38,16 @@ def load_rust_config() -> dict:
     except Exception as e:
         logging.exception("Failed to load rust_config.json: %s", e)
     return {}
+
+
+def user_has_any_role(member: discord.Member, role_ids: list[int]) -> bool:
+    """Return True if member has any of the roles in role_ids."""
+    if not isinstance(member, discord.Member):
+        return False
+    wanted = {rid for rid in role_ids if rid}  # ignore zeros
+    if not wanted:
+        return False
+    return any((role.id in wanted) for role in member.roles)
 
 
 RUST_CFG = load_rust_config()
@@ -271,6 +283,146 @@ async def send_alert(
     await channel.send(content=content, embed=embed)
 
 
+class ConnectSelect(discord.ui.Select):
+    def __init__(self, profiles: list[dict]):
+        # Build options from profiles
+        options: list[discord.SelectOption] = []
+        for p in profiles:
+            label = p.get("label", "Unnamed server")
+            key = p.get("key", "")
+            category = p.get("category", "")
+            emoji = p.get("emoji") or None
+
+            # description shows category + optional notes, truncated by Discord automatically
+            notes = p.get("notes") or ""
+            desc_parts = []
+            if category:
+                desc_parts.append(category)
+            if notes:
+                desc_parts.append(notes)
+            description = " • ".join(desc_parts) if desc_parts else None
+
+            option = discord.SelectOption(
+                label=label[:100],      # Discord limit
+                description=description[:100] if description else None,
+                value=key,
+                emoji=emoji,
+            )
+            options.append(option)
+
+        placeholder = "Choose a server to get its F1 connect command..."
+        super().__init__(
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            options=options[:25],  # Discord max options = 25
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        key = self.values[0]
+        profile = CONNECT_PROFILE_INDEX.get(key)
+        if not profile:
+            await interaction.response.send_message(
+                "❌ That server profile could not be found. Ask an admin to refresh the config.",
+                ephemeral=True,
+            )
+            return
+
+        f1 = profile.get("f1", "")
+        label = profile.get("label", key)
+
+        if not f1:
+            await interaction.response.send_message(
+                f"❌ No F1 connect string defined for **{label}**.",
+                ephemeral=True,
+            )
+            return
+
+        msg = (
+            f"**{label}**\n\n"
+            "Copy & paste this into your Rust F1 console:\n"
+            f"```{f1}```"
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+class ConnectMenuView(discord.ui.View):
+    def __init__(self, profiles: list[dict], timeout: float | None = 120.0):
+        super().__init__(timeout=timeout)
+        if profiles:
+            self.add_item(ConnectSelect(profiles))
+
+def is_leadership():
+    """App command check: allow leadership role or server admins."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        # No guild = no permission
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return False
+
+        # If a leadership role is configured, require it
+        if RUST_ROLE_LEADERSHIP_ID:
+            role = interaction.guild.get_role(RUST_ROLE_LEADERSHIP_ID)
+            if role and role in interaction.user.roles:
+                return True
+
+        # Fallback: allow admins
+        return interaction.user.guild_permissions.administrator
+
+    return app_commands.check(predicate)
+
+
+# Load .env
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+# -------------------------
+# DISCORD – CORE AUTH
+# -------------------------
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
+DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0") or 0)
+
+# -------------------------
+# DISCORD – CHANNELS
+# -------------------------
+DISCORD_GENERAL_CHAT = int(os.getenv("DISCORD_GENERAL_CHAT", "0") or 0)
+DISCORD_TEST_CHANNEL = int(os.getenv("DISCORD_TEST_CHANNEL", "0") or 0)
+DISCORD_RAID_ALERTS_CHANNEL = int(os.getenv("DISCORD_RAID_ALERTS_CHANNEL", "0") or 0)
+DISCORD_TC_STATUS_CHANNEL = int(os.getenv("DISCORD_TC_STATUS_CHANNEL", "0") or 0)
+DISCORD_TRAINING_ANNOUNCE_CHANNEL = int(os.getenv("DISCORD_TRAINING_ANNOUNCE_CHANNEL", "0") or 0)
+DISCORD_RECRUITING_CHANNEL = int(os.getenv("DISCORD_RECRUITING_CHANNEL", "0") or 0)
+DISCORD_COMMAND_LOG_CHANNEL = int(os.getenv("DISCORD_COMMAND_LOG_CHANNEL", "0") or 0)
+DISCORD_ERROR_LOG_CHANNEL = int(os.getenv("DISCORD_ERROR_LOG_CHANNEL", "0") or 0)
+
+# -------------------------
+# DISCORD – ROLES
+# -------------------------
+RUST_ROLE_RUSTTEAM_ID = int(os.getenv("RUST_ROLE_RUSTTEAM_ID", "0") or 0)
+RUST_ROLE_PVP_ID = int(os.getenv("RUST_ROLE_PVP_ID", "0") or 0)
+RUST_ROLE_BUILDER_ID = int(os.getenv("RUST_ROLE_BUILDER_ID", "0") or 0)
+RUST_ROLE_FARMER_ID = int(os.getenv("RUST_ROLE_FARMER_ID", "0") or 0)
+RUST_ROLE_RECRUITER_ID = int(os.getenv("RUST_ROLE_RECRUITER_ID", "0") or 0)
+RUST_ROLE_EVENT_COORD_ID = int(os.getenv("RUST_ROLE_EVENT_COORD_ID", "0") or 0)
+RUST_ROLE_LEADERSHIP_ID = int(os.getenv("RUST_ROLE_LEADERSHIP_ID", "0") or 0)
+
+# Duty status roles
+RUST_ROLE_ACTIVE_DUTY_ID = int(os.getenv("RUST_ROLE_ACTIVE_DUTY_ID", "0") or 0)
+RUST_ROLE_RESERVES_ID = int(os.getenv("RUST_ROLE_RESERVES_ID", "0") or 0)
+RUST_ROLE_INACTIVE_RESERVES_ID = int(os.getenv("RUST_ROLE_INACTIVE_RESERVES_ID", "0") or 0)
+RUST_ROLE_VISITOR_ID = int(os.getenv("RUST_ROLE_VISITOR_ID", "0") or 0)
+
+# -------------------------
+# RUST+ API
+# -------------------------
+RUSTPLUS_API_BASE = os.getenv("RUSTPLUS_API_BASE", "").rstrip("/")
+
+# -------------------------
+# MISC
+# -------------------------
+ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+BOT_PREFIX = os.getenv("BOT_PREFIX", "!")
+
+
 # ---------- BOT EVENTS ----------
 
 @bot.event
@@ -290,6 +442,52 @@ async def on_ready():
     except Exception as e:
         logging.exception("Failed to sync app commands: %s", e)
 
+# -------------------------
+# CONNECT MENU CONFIG
+# -------------------------
+
+CONNECT_CONFIG_PATH = os.getenv("CONNECT_CONFIG_PATH") or os.path.join(BASE_DIR, "connect_servers.json")
+
+
+def load_connect_profiles():
+    """
+    Load server connect profiles from JSON.
+    Each profile needs: key, label, f1, optional category/emoji/notes
+    """
+    try:
+        with open(CONNECT_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, list):
+                logging.warning("connect_servers.json is not a list; ignoring.")
+                return [], {}
+    except FileNotFoundError:
+        logging.warning("connect_servers.json not found; /connect menu will be empty.")
+        return [], {}
+    except Exception as e:
+        logging.exception("Failed to load connect_servers.json: %s", e)
+        return [], {}
+
+    profiles: list[dict] = []
+    index: dict[str, dict] = {}
+
+    for entry in data:
+        key = entry.get("key")
+        label = entry.get("label")
+        f1 = entry.get("f1")
+
+        if not key or not label or not f1:
+            logging.warning("Skipping invalid connect profile (missing key/label/f1): %r", entry)
+            continue
+
+        profiles.append(entry)
+        index[key] = entry
+
+    logging.info("Loaded %d connect profiles from %s", len(profiles), CONNECT_CONFIG_PATH)
+    return profiles, index
+
+
+CONNECT_PROFILES, CONNECT_PROFILE_INDEX = load_connect_profiles()
+
 
 # ---------- SLASH COMMANDS ----------
 
@@ -301,20 +499,20 @@ async def ping(interaction: discord.Interaction):
     )
 
 
-@tree.command(description="Show the F1 console connect command for this wipe.")
-async def connect(interaction: discord.Interaction):
-    if not F1_CONNECT:
-        await interaction.response.send_message(
-            "No F1 connect string configured yet. Ask staff to update `rust_config.json`.",
-            ephemeral=True,
-        )
-        return
+# @tree.command(description="Show the F1 console connect command for this wipe.")
+# async def connect(interaction: discord.Interaction):
+#     if not F1_CONNECT:
+#         await interaction.response.send_message(
+#             "No F1 connect string configured yet. Ask staff to update `rust_config.json`.",
+#             ephemeral=True,
+#         )
+#         return
 
-    await interaction.response.send_message(
-        "Copy & paste this into your Rust F1 console:\n"
-        f"```{F1_CONNECT}```",
-        ephemeral=True,
-    )
+#     await interaction.response.send_message(
+#         "Copy & paste this into your Rust F1 console:\n"
+#         f"```{F1_CONNECT}```",
+#         ephemeral=True,
+#     )
 
 
 @tree.command(description="Send a test raid alert to the raid channel.")
@@ -386,6 +584,48 @@ async def base_offline(interaction: discord.Interaction, base_name: str = "Main"
     await interaction.response.send_message(
         f"Offline status alert sent for **{base_name}** ✅", ephemeral=True
     )
+
+
+@tree.command(description="Open a menu of Rust servers to connect to (F1 console commands).")
+async def connect(interaction: discord.Interaction):
+    if not CONNECT_PROFILES:
+        await interaction.response.send_message(
+            "No connect profiles are configured yet. Ask staff to update `connect_servers.json`.",
+            ephemeral=True,
+        )
+        return
+
+    view = ConnectMenuView(CONNECT_PROFILES)
+    await interaction.response.send_message(
+        "Select a server to get its F1 connect command:",
+        view=view,
+        ephemeral=True,
+    )
+
+
+@tree.command(description="Reload /connect server profiles from the config file.")
+@is_leadership()
+async def connect_reload(interaction: discord.Interaction):
+    """Reload connect_servers.json without restarting the bot."""
+    global CONNECT_PROFILES, CONNECT_PROFILE_INDEX
+
+    new_profiles, new_index = load_connect_profiles()
+    CONNECT_PROFILES = new_profiles
+    CONNECT_PROFILE_INDEX = new_index
+
+    if not CONNECT_PROFILES:
+        msg = (
+            f"Reloaded connect profiles from `{os.path.basename(CONNECT_CONFIG_PATH)}`, "
+            "but no valid profiles were found. Check the JSON format."
+        )
+    else:
+        msg = (
+            f"Reloaded **{len(CONNECT_PROFILES)}** connect profiles from "
+            f"`{os.path.basename(CONNECT_CONFIG_PATH)}` ✅"
+        )
+
+    await interaction.response.send_message(msg, ephemeral=True)
+
 
 # ---------- SAM & HQ SWITCH COMMANDS ----------
 
