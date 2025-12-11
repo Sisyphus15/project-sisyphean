@@ -443,28 +443,45 @@ async def on_ready():
 CONNECT_CONFIG_PATH = os.getenv("CONNECT_CONFIG_PATH") or os.path.join(BASE_DIR, "connect_servers.json")
 
 
+def _read_connect_config_raw() -> list[dict]:
+    """Read the raw JSON list from CONNECT_CONFIG_PATH. Returns [] on error."""
+    try:
+        with open(CONNECT_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            logging.warning("connect_servers.json is not a list; using empty list.")
+            return []
+    except FileNotFoundError:
+        logging.warning("connect_servers.json not found; starting with empty list.")
+        return []
+    except Exception as e:
+        logging.exception("Failed to read connect_servers.json: %s", e)
+        return []
+
+
+def _write_connect_config_raw(entries: list[dict]) -> bool:
+    """Write the given list back to CONNECT_CONFIG_PATH. Returns True on success."""
+    try:
+        with open(CONNECT_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        logging.exception("Failed to write connect_servers.json: %s", e)
+        return False
+
+
+
 def load_connect_profiles():
     """
     Load server connect profiles from JSON.
     Each profile needs: key, label, f1, optional category/emoji/notes
     """
-    try:
-        with open(CONNECT_CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if not isinstance(data, list):
-                logging.warning("connect_servers.json is not a list; ignoring.")
-                return [], {}
-    except FileNotFoundError:
-        logging.warning("connect_servers.json not found; /connect menu will be empty.")
-        return [], {}
-    except Exception as e:
-        logging.exception("Failed to load connect_servers.json: %s", e)
-        return [], {}
-
+    raw = _read_connect_config_raw()
     profiles: list[dict] = []
     index: dict[str, dict] = {}
 
-    for entry in data:
+    for entry in raw:
         key = entry.get("key")
         label = entry.get("label")
         f1 = entry.get("f1")
@@ -603,6 +620,227 @@ async def connect_reload(interaction: discord.Interaction):
         )
 
     await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(description="Add a new server profile to the /connect menu.")
+async def connect_add(
+    interaction: discord.Interaction,
+    key: str,
+    label: str,
+    f1: str,
+    category: str | None = None,
+    emoji: str | None = None,
+    notes: str | None = None,
+):
+    """Leadership-only: add a new connect profile."""
+    # Must be in guild & be a Member
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    # Permissions
+    allowed_role_ids = [
+        RUST_ROLE_LEADERSHIP_ID,
+        RUST_ROLE_RECRUITER_ID,
+        RUST_ROLE_EVENT_COORD_ID,
+    ]
+    if not user_has_any_role(interaction.user, allowed_role_ids):
+        await interaction.response.send_message(
+            "❌ You don't have permission to modify /connect profiles.",
+            ephemeral=True,
+        )
+        return
+
+    key = key.strip()
+    label = label.strip()
+    f1 = f1.strip()
+
+    if not key or not label or not f1:
+        await interaction.response.send_message(
+            "❌ key, label, and f1 are required.",
+            ephemeral=True,
+        )
+        return
+
+    # Load current entries
+    entries = _read_connect_config_raw()
+
+    # Ensure key is unique
+    for entry in entries:
+        if entry.get("key") == key:
+            await interaction.response.send_message(
+                f"❌ A profile with key `{key}` already exists.",
+                ephemeral=True,
+            )
+            return
+
+    new_entry = {
+        "key": key,
+        "label": label,
+        "f1": f1,
+    }
+    if category:
+        new_entry["category"] = category
+    if emoji:
+        new_entry["emoji"] = emoji
+    if notes:
+        new_entry["notes"] = notes
+
+    entries.append(new_entry)
+
+    if not _write_connect_config_raw(entries):
+        await interaction.response.send_message(
+            "❌ Failed to write connect_servers.json. Check logs.",
+            ephemeral=True,
+        )
+        return
+
+    # Reload in-memory profiles
+    global CONNECT_PROFILES, CONNECT_PROFILE_INDEX
+    CONNECT_PROFILES, CONNECT_PROFILE_INDEX = load_connect_profiles()
+
+    await interaction.response.send_message(
+        f"✅ Added new connect profile **{label}** (`{key}`).",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(description="Remove a server profile from the /connect menu.")
+async def connect_remove(
+    interaction: discord.Interaction,
+    key: str,
+):
+    """Leadership-only: remove an existing connect profile by key."""
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    allowed_role_ids = [
+        RUST_ROLE_LEADERSHIP_ID,
+        RUST_ROLE_RECRUITER_ID,
+        RUST_ROLE_EVENT_COORD_ID,
+    ]
+    if not user_has_any_role(interaction.user, allowed_role_ids):
+        await interaction.response.send_message(
+            "❌ You don't have permission to modify /connect profiles.",
+            ephemeral=True,
+        )
+        return
+
+    key = key.strip()
+    if not key:
+        await interaction.response.send_message(
+            "❌ Please provide a profile key to remove.",
+            ephemeral=True,
+        )
+        return
+
+    entries = _read_connect_config_raw()
+    before = len(entries)
+    entries = [e for e in entries if e.get("key") != key]
+    removed = before - len(entries)
+
+    if removed == 0:
+        await interaction.response.send_message(
+            f"❌ No profile found with key `{key}`.",
+            ephemeral=True,
+        )
+        return
+
+    if not _write_connect_config_raw(entries):
+        await interaction.response.send_message(
+            "❌ Failed to write connect_servers.json. Check logs.",
+            ephemeral=True,
+        )
+        return
+
+    global CONNECT_PROFILES, CONNECT_PROFILE_INDEX
+    CONNECT_PROFILES, CONNECT_PROFILE_INDEX = load_connect_profiles()
+
+    await interaction.response.send_message(
+        f"✅ Removed **{removed}** profile(s) with key `{key}`.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(description="Update the F1 connect string (and optionally label/category) for a server profile.")
+async def connect_set_f1(
+    interaction: discord.Interaction,
+    key: str,
+    f1: str,
+    label: str | None = None,
+    category: str | None = None,
+):
+    """Leadership-only: update an existing profile's F1 string."""
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    allowed_role_ids = [
+        RUST_ROLE_LEADERSHIP_ID,
+        RUST_ROLE_RECRUITER_ID,
+        RUST_ROLE_EVENT_COORD_ID,
+    ]
+    if not user_has_any_role(interaction.user, allowed_role_ids):
+        await interaction.response.send_message(
+            "❌ You don't have permission to modify /connect profiles.",
+            ephemeral=True,
+        )
+        return
+
+    key = key.strip()
+    f1 = f1.strip()
+
+    if not key or not f1:
+        await interaction.response.send_message(
+            "❌ key and f1 are required.",
+            ephemeral=True,
+        )
+        return
+
+    entries = _read_connect_config_raw()
+    found = False
+
+    for entry in entries:
+        if entry.get("key") == key:
+            entry["f1"] = f1
+            if label:
+                entry["label"] = label
+            if category:
+                entry["category"] = category
+            found = True
+            break
+
+    if not found:
+        await interaction.response.send_message(
+            f"❌ No profile found with key `{key}`.",
+            ephemeral=True,
+        )
+        return
+
+    if not _write_connect_config_raw(entries):
+        await interaction.response.send_message(
+            "❌ Failed to write connect_servers.json. Check logs.",
+            ephemeral=True,
+        )
+        return
+
+    global CONNECT_PROFILES, CONNECT_PROFILE_INDEX
+    CONNECT_PROFILES, CONNECT_PROFILE_INDEX = load_connect_profiles()
+
+    await interaction.response.send_message(
+        f"✅ Updated F1 connect string for profile `{key}`.",
+        ephemeral=True,
+    )
 
 
 # ---------- SAM & HQ SWITCH COMMANDS ----------

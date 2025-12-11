@@ -31,7 +31,6 @@
     "emoji": "🇺🇸",
     "notes": "US Main server"
   },
-
   {
     "key": "train_build",
     "label": "Build Training Map",
@@ -47,5 +46,13 @@
     "f1": "client.connect 0.0.0.0:28016",
     "emoji": "⚔️",
     "notes": "Replace with aim train / event server"
+  },
+  {
+    "key": "Rustopia.gg",
+    "label": "Rustopia.gg - US Large",
+    "f1": "USLarge.Rustopia.gg:28015",
+    "category": "Wipe",
+    "emoji": "🇺🇸",
+    "notes": "Monthly"
   }
 ]
