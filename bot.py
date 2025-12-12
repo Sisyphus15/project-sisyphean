@@ -392,6 +392,7 @@ DISCORD_TRAINING_ANNOUNCE_CHANNEL = int(os.getenv("DISCORD_TRAINING_ANNOUNCE_CHA
 DISCORD_RECRUITING_CHANNEL = int(os.getenv("DISCORD_RECRUITING_CHANNEL", "0") or 0)
 DISCORD_COMMAND_LOG_CHANNEL = int(os.getenv("DISCORD_COMMAND_LOG_CHANNEL", "0") or 0)
 DISCORD_ERROR_LOG_CHANNEL = int(os.getenv("DISCORD_ERROR_LOG_CHANNEL", "0") or 0)
+DUTY_STATUS_LOG_CHANNEL = int(os.getenv("DUTY_STATUS_LOG_CHANNEL", "0") or 0)
 
 # -------------------------
 # DISCORD – ROLES
@@ -558,6 +559,19 @@ async def apply_duty_status(guild: discord.Guild, member: discord.Member, status
 
     # Pretty label
     return status_key.replace("_", " ").title()
+
+
+def pretty_status_label(status_key: str | None) -> str:
+    if not status_key:
+        return "None"
+    key = status_key.strip().lower()
+    if key == "active_duty":
+        return "Active Duty"
+    if key == "reservist":
+        return "Reservist"
+    if key == "inactive_reservist":
+        return "Inactive Reservist"
+    return key.replace("_", " ").title()
 
 
 # ---------- DUTY STATUS PERSISTENCE ----------
@@ -1323,13 +1337,16 @@ async def status_info(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tree.command(description="Audit and normalize duty statuses for all members.")
+@tree.command(description="Audit and enforce duty statuses for all members.")
 async def status_audit(interaction: discord.Interaction):
     """
-    Leadership-only: scan guild members and:
-    - Re-apply last-known duty status where roles were manually changed
-    - Normalize to exactly one duty role when possible
-    - Adopt manual single-duty-role changes as new canonical state
+    Leadership-only: enforce duty_status.json as the source of truth.
+
+    Rules:
+    - If a recorded status exists: member is forced to that status.
+    - If no recorded status and member has NO duty roles: leave unchanged.
+    - If no recorded status and member HAS any duty roles: reset to default (inactive_reservist).
+    Also produces a per-member change report.
     """
     if not interaction.guild:
         await interaction.response.send_message(
@@ -1350,10 +1367,12 @@ async def status_audit(interaction: discord.Interaction):
     status_roles = get_duty_status_role_ids()
     roleid_to_key = {rid: key for key, rid in status_roles.items() if rid}
 
-    fixed_by_record = 0
-    adopted_manual = 0
-    normalized_multi = 0
+    reset_to_recorded = 0
+    reset_to_default = 0
     untouched = 0
+
+    enforced_entries: list[str] = []
+    default_entries: list[str] = []
 
     global DUTY_STATUS_STATE
 
@@ -1372,58 +1391,105 @@ async def status_audit(interaction: discord.Interaction):
 
         actual_set = set(actual_keys)
 
-        if not recorded and not actual_set:
-            untouched += 1
-            continue
-
-        if recorded in DUTY_STATUS_KEYS and actual_set == {recorded}:
-            untouched += 1
-            continue
+        if actual_set:
+            actual_label = ", ".join(sorted(pretty_status_label(k) for k in actual_set))
+        else:
+            actual_label = "None"
 
         if recorded in DUTY_STATUS_KEYS:
+            if actual_set == {recorded}:
+                untouched += 1
+                continue
+
             try:
+                old_label = actual_label
+                new_label = pretty_status_label(recorded)
                 await apply_duty_status(guild, member, recorded)
-                fixed_by_record += 1
+                reset_to_recorded += 1
+                enforced_entries.append(
+                    f"- {member.mention} — **{old_label}** → **{new_label}**"
+                )
             except Exception as e:
-                logging.exception("Failed to re-apply recorded duty status for %s: %s", member.id, e)
+                logging.exception(
+                    "Failed to enforce recorded duty status for %s: %s",
+                    member.id,
+                    e,
+                )
             continue
 
-        if len(actual_set) == 1:
-            adopted_key = next(iter(actual_set))
-            DUTY_STATUS_STATE[user_id_str] = adopted_key
-            _save_duty_status_state(DUTY_STATUS_STATE)
-            adopted_manual += 1
+        if not actual_set:
+            untouched += 1
             continue
 
-        if len(actual_set) > 1:
-            for choice in ["active_duty", "reservist", "inactive_reservist"]:
-                if choice in actual_set:
-                    try:
-                        await apply_duty_status(guild, member, choice)
-                        DUTY_STATUS_STATE[user_id_str] = choice
-                        _save_duty_status_state(DUTY_STATUS_STATE)
-                        normalized_multi += 1
-                    except Exception as e:
-                        logging.exception("Failed to normalize multi duty roles for %s: %s", member.id, e)
-                    break
-            continue
-
-        untouched += 1
+        default_status = "inactive_reservist"
+        try:
+            old_label = actual_label
+            new_label = pretty_status_label(default_status)
+            await apply_duty_status(guild, member, default_status)
+            reset_to_default += 1
+            default_entries.append(
+                f"- {member.mention} — **{old_label}** → **{new_label}** (no record)"
+            )
+        except Exception as e:
+            logging.exception(
+                "Failed to reset unrecorded member %s to default duty status: %s",
+                member.id,
+                e,
+            )
 
     desc_lines = [
         "Duty Status Audit Complete:",
-        f"• ✅ Reset to recorded status: **{fixed_by_record}** member(s)",
-        f"• ✅ Adopted manual single-role status: **{adopted_manual}** member(s)",
-        f"• ✅ Normalized multiple duty roles: **{normalized_multi}** member(s)",
+        f"• ✅ Enforced recorded status: **{reset_to_recorded}** member(s)",
+        f"• ✅ Reset illegal manual duty roles to default (Inactive Reservist): **{reset_to_default}** member(s)",
         f"• ➖ Left unchanged: **{untouched}** member(s)",
     ]
+
     embed = discord.Embed(
         title="Duty Status Audit",
         description="\n".join(desc_lines),
         color=discord.Color.orange(),
     )
 
+    detail_lines: list[str] = []
+    if enforced_entries:
+        detail_lines.append("**Enforced recorded status:**")
+        detail_lines.extend(enforced_entries)
+        detail_lines.append("")
+    if default_entries:
+        detail_lines.append("**Reset to default (no record):**")
+        detail_lines.extend(default_entries)
+
+    detail_text = "\n".join(detail_lines) if detail_lines else "No members were changed."
+
+    max_ephemeral_chars = 1800
+    short_detail = (
+        detail_text
+        if len(detail_text) <= max_ephemeral_chars
+        else "\n".join(detail_text.splitlines()[:25]) + "\n… (see log channel for full list)"
+    )
+
+    embed.add_field(name="Changed Members", value=short_detail, inline=False)
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    if DUTY_STATUS_LOG_CHANNEL and (enforced_entries or default_entries):
+        log_channel = guild.get_channel(DUTY_STATUS_LOG_CHANNEL)
+        if log_channel:
+            log_embed = discord.Embed(
+                title="Duty Status Audit Report",
+                description="\n".join(desc_lines),
+                color=discord.Color.orange(),
+            )
+            log_embed.add_field(
+                name="Changed Members",
+                value=detail_text,
+                inline=False,
+            )
+            log_embed.set_footer(text=f"Triggered by {interaction.user.display_name}")
+            try:
+                await log_channel.send(embed=log_embed)
+            except Exception as e:
+                logging.exception("Failed to send duty status audit log: %s", e)
 
 
 # ---------- INTERACTIVE MENU ----------
