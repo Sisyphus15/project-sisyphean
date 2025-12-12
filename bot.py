@@ -515,13 +515,21 @@ def get_duty_status_role_ids() -> dict[str, int]:
     return {key: get_role_id(key) for key in DUTY_STATUS_KEYS}
 
 
-async def apply_duty_status(guild: discord.Guild, member: discord.Member, status_key: str) -> str:
+async def apply_duty_status(
+    guild: discord.Guild,
+    member: discord.Member,
+    status_key: str,
+    *,
+    actor: discord.abc.User | None = None,
+    source: str = "manual",
+) -> str:
     """
     Core logic to change a member's duty status.
     - status_key must be one of: 'active_duty', 'reservist', 'inactive_reservist'
     - Removes all three duty status roles
     - Adds the selected one
     - Persists the status in DUTY_STATUS_STATE
+    - Logs the change to DUTY_STATUS_LOG_CHANNEL (if configured)
     - Returns a pretty label for display
     """
     status_key = status_key.strip().lower()
@@ -537,7 +545,19 @@ async def apply_duty_status(guild: discord.Guild, member: discord.Member, status
     if not target_role_id:
         raise ValueError(f"No role configured for status '{status_key}'. Check roles_config.json.")
 
-    # Remove any existing duty status roles
+    roleid_to_key = {rid: key for key, rid in status_roles.items() if rid}
+
+    old_keys = {
+        roleid_to_key[role.id]
+        for role in member.roles
+        if role.id in roleid_to_key
+    }
+    old_label = (
+        ", ".join(sorted(pretty_status_label(k) for k in old_keys))
+        if old_keys
+        else "None"
+    )
+
     for key, rid in status_roles.items():
         if not rid:
             continue
@@ -545,20 +565,42 @@ async def apply_duty_status(guild: discord.Guild, member: discord.Member, status
         if role and role in member.roles:
             await member.remove_roles(role, reason="Changing duty status")
 
-    # Add the new status role
     new_role = guild.get_role(target_role_id)
     if not new_role:
         raise ValueError(f"Role for status '{status_key}' not found in guild.")
 
     await member.add_roles(new_role, reason="Duty status update")
 
-    # Persist last-known duty status
     global DUTY_STATUS_STATE
     DUTY_STATUS_STATE[str(member.id)] = status_key
     _save_duty_status_state(DUTY_STATUS_STATE)
 
-    # Pretty label
-    return status_key.replace("_", " ").title()
+    new_label = pretty_status_label(status_key)
+
+    if DUTY_STATUS_LOG_CHANNEL:
+        log_channel = guild.get_channel(DUTY_STATUS_LOG_CHANNEL)
+        if log_channel:
+            desc_lines = [
+                f"**Member:** {member.mention}",
+                f"**Old:** {old_label}",
+                f"**New:** {new_label}",
+                f"**Source:** {source}",
+            ]
+            if actor:
+                desc_lines.append(f"**By:** {actor.mention}")
+
+            embed = discord.Embed(
+                title="Duty Status Change",
+                description="\n".join(desc_lines),
+                color=discord.Color.blue(),
+                timestamp=datetime.utcnow(),
+            )
+            try:
+                await log_channel.send(embed=embed)
+            except Exception as e:
+                logging.exception("Failed to send duty status change log: %s", e)
+
+    return new_label
 
 
 def pretty_status_label(status_key: str | None) -> str:
@@ -1288,7 +1330,13 @@ async def status_set(
     status_key = status.value  # "active_duty" / "reservist" / "inactive_reservist"
 
     try:
-        pretty = await apply_duty_status(interaction.guild, member, status_key)
+        pretty = await apply_duty_status(
+            interaction.guild,
+            member,
+            status_key,
+            actor=interaction.user,
+            source="status_set",
+        )
     except ValueError as e:
         await interaction.response.send_message(
             f"❌ {e}",
@@ -1401,10 +1449,16 @@ async def status_audit(interaction: discord.Interaction):
                 untouched += 1
                 continue
 
-            try:
-                old_label = actual_label
-                new_label = pretty_status_label(recorded)
-                await apply_duty_status(guild, member, recorded)
+        try:
+            old_label = actual_label
+            new_label = pretty_status_label(recorded)
+            await apply_duty_status(
+                guild,
+                member,
+                recorded,
+                actor=interaction.user,
+                source="status_audit",
+            )
                 reset_to_recorded += 1
                 enforced_entries.append(
                     f"- {member.mention} — **{old_label}** → **{new_label}**"
@@ -1425,7 +1479,13 @@ async def status_audit(interaction: discord.Interaction):
         try:
             old_label = actual_label
             new_label = pretty_status_label(default_status)
-            await apply_duty_status(guild, member, default_status)
+            await apply_duty_status(
+                guild,
+                member,
+                default_status,
+                actor=interaction.user,
+                source="status_audit_default",
+            )
             reset_to_default += 1
             default_entries.append(
                 f"- {member.mention} — **{old_label}** → **{new_label}** (no record)"
@@ -1734,7 +1794,13 @@ class HQView(discord.ui.View):
             return
 
         try:
-            pretty = await apply_duty_status(interaction.guild, interaction.user, "active_duty")
+            pretty = await apply_duty_status(
+                interaction.guild,
+                interaction.user,
+                "active_duty",
+                actor=interaction.user,
+                source="hq_button",
+            )
         except ValueError as e:
             await interaction.response.send_message(
                 f"❌ {e}",
@@ -1761,7 +1827,13 @@ class HQView(discord.ui.View):
             return
 
         try:
-            pretty = await apply_duty_status(interaction.guild, interaction.user, "reservist")
+            pretty = await apply_duty_status(
+                interaction.guild,
+                interaction.user,
+                "reservist",
+                actor=interaction.user,
+                source="hq_button",
+            )
         except ValueError as e:
             await interaction.response.send_message(
                 f"❌ {e}",
@@ -1788,7 +1860,13 @@ class HQView(discord.ui.View):
             return
 
         try:
-            pretty = await apply_duty_status(interaction.guild, interaction.user, "inactive_reservist")
+            pretty = await apply_duty_status(
+                interaction.guild,
+                interaction.user,
+                "inactive_reservist",
+                actor=interaction.user,
+                source="hq_button",
+            )
         except ValueError as e:
             await interaction.response.send_message(
                 f"❌ {e}",
