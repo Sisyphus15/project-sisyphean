@@ -442,6 +442,7 @@ async def on_ready():
 
 CONNECT_CONFIG_PATH = os.getenv("CONNECT_CONFIG_PATH") or os.path.join(BASE_DIR, "connect_servers.json")
 ROLES_CONFIG_PATH = os.getenv("ROLES_CONFIG_PATH") or os.path.join(BASE_DIR, "roles_config.json")
+DUTY_STATUS_STATE_PATH = os.getenv("DUTY_STATUS_STATE_PATH") or os.path.join(BASE_DIR, "duty_status.json")
 
 
 # ---------- ROLE CONFIG ----------
@@ -519,6 +520,7 @@ async def apply_duty_status(guild: discord.Guild, member: discord.Member, status
     - status_key must be one of: 'active_duty', 'reservist', 'inactive_reservist'
     - Removes all three duty status roles
     - Adds the selected one
+    - Persists the status in DUTY_STATUS_STATE
     - Returns a pretty label for display
     """
     status_key = status_key.strip().lower()
@@ -549,8 +551,50 @@ async def apply_duty_status(guild: discord.Guild, member: discord.Member, status
 
     await member.add_roles(new_role, reason="Duty status update")
 
-    # Nice human-readable label
+    # Persist last-known duty status
+    global DUTY_STATUS_STATE
+    DUTY_STATUS_STATE[str(member.id)] = status_key
+    _save_duty_status_state(DUTY_STATUS_STATE)
+
+    # Pretty label
     return status_key.replace("_", " ").title()
+
+
+# ---------- DUTY STATUS PERSISTENCE ----------
+
+def _load_duty_status_state() -> dict[str, str]:
+    """
+    Load last-known duty status per user from duty_status.json.
+    Keys are str(user_id), values are status keys like 'active_duty'.
+    """
+    try:
+        with open(DUTY_STATUS_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+            logging.warning("duty_status.json is not an object; ignoring.")
+            return {}
+    except FileNotFoundError:
+        logging.info("duty_status.json not found; starting with empty duty state.")
+        return {}
+    except Exception as e:
+        logging.exception("Failed to read duty_status.json: %s", e)
+        return {}
+
+
+def _save_duty_status_state(state: dict[str, str]) -> bool:
+    """Write duty status state to disk. Returns True on success."""
+    try:
+        with open(DUTY_STATUS_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        logging.exception("Failed to write duty_status.json: %s", e)
+        return False
+
+
+DUTY_STATUS_STATE: dict[str, str] = _load_duty_status_state()
+logging.info("Loaded %d duty status entries from duty_status.json", len(DUTY_STATUS_STATE))
 
 
 def _read_connect_config_raw() -> list[dict]:
@@ -1274,6 +1318,109 @@ async def status_info(interaction: discord.Interaction, member: discord.Member):
         title=f"Duty Status — {member.display_name}",
         description=f"**{user_status}**",
         color=discord.Color.blue(),
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(description="Audit and normalize duty statuses for all members.")
+async def status_audit(interaction: discord.Interaction):
+    """
+    Leadership-only: scan guild members and:
+    - Re-apply last-known duty status where roles were manually changed
+    - Normalize to exactly one duty role when possible
+    - Adopt manual single-duty-role changes as new canonical state
+    """
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    allowed_role_ids = [get_role_id("leadership")]
+    if not user_has_any_role(interaction.user, allowed_role_ids):
+        await interaction.response.send_message(
+            "❌ You don't have permission to audit duty statuses.",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    status_roles = get_duty_status_role_ids()
+    roleid_to_key = {rid: key for key, rid in status_roles.items() if rid}
+
+    fixed_by_record = 0
+    adopted_manual = 0
+    normalized_multi = 0
+    untouched = 0
+
+    global DUTY_STATUS_STATE
+
+    for member in guild.members:
+        if member.bot:
+            continue
+
+        user_id_str = str(member.id)
+        recorded = DUTY_STATUS_STATE.get(user_id_str)
+
+        actual_keys = []
+        for role in member.roles:
+            key = roleid_to_key.get(role.id)
+            if key:
+                actual_keys.append(key)
+
+        actual_set = set(actual_keys)
+
+        if not recorded and not actual_set:
+            untouched += 1
+            continue
+
+        if recorded in DUTY_STATUS_KEYS and actual_set == {recorded}:
+            untouched += 1
+            continue
+
+        if recorded in DUTY_STATUS_KEYS:
+            try:
+                await apply_duty_status(guild, member, recorded)
+                fixed_by_record += 1
+            except Exception as e:
+                logging.exception("Failed to re-apply recorded duty status for %s: %s", member.id, e)
+            continue
+
+        if len(actual_set) == 1:
+            adopted_key = next(iter(actual_set))
+            DUTY_STATUS_STATE[user_id_str] = adopted_key
+            _save_duty_status_state(DUTY_STATUS_STATE)
+            adopted_manual += 1
+            continue
+
+        if len(actual_set) > 1:
+            for choice in ["active_duty", "reservist", "inactive_reservist"]:
+                if choice in actual_set:
+                    try:
+                        await apply_duty_status(guild, member, choice)
+                        DUTY_STATUS_STATE[user_id_str] = choice
+                        _save_duty_status_state(DUTY_STATUS_STATE)
+                        normalized_multi += 1
+                    except Exception as e:
+                        logging.exception("Failed to normalize multi duty roles for %s: %s", member.id, e)
+                    break
+            continue
+
+        untouched += 1
+
+    desc_lines = [
+        "Duty Status Audit Complete:",
+        f"• ✅ Reset to recorded status: **{fixed_by_record}** member(s)",
+        f"• ✅ Adopted manual single-role status: **{adopted_manual}** member(s)",
+        f"• ✅ Normalized multiple duty roles: **{normalized_multi}** member(s)",
+        f"• ➖ Left unchanged: **{untouched}** member(s)",
+    ]
+    embed = discord.Embed(
+        title="Duty Status Audit",
+        description="\n".join(desc_lines),
+        color=discord.Color.orange(),
     )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
