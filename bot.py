@@ -441,6 +441,66 @@ async def on_ready():
 # -------------------------
 
 CONNECT_CONFIG_PATH = os.getenv("CONNECT_CONFIG_PATH") or os.path.join(BASE_DIR, "connect_servers.json")
+ROLES_CONFIG_PATH = os.getenv("ROLES_CONFIG_PATH") or os.path.join(BASE_DIR, "roles_config.json")
+
+
+# ---------- ROLE CONFIG ----------
+
+def _read_roles_config_raw() -> dict[str, int]:
+    """Read roles_config.json, return {name: id} or {} on error."""
+    try:
+        with open(ROLES_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                # normalize to int where possible
+                cleaned: dict[str, int] = {}
+                for k, v in data.items():
+                    try:
+                        cleaned[str(k).strip().lower()] = int(v)
+                    except (TypeError, ValueError):
+                        logging.warning("Invalid role id for %s in roles_config.json: %r", k, v)
+                return cleaned
+            logging.warning("roles_config.json is not an object; ignoring.")
+            return {}
+    except FileNotFoundError:
+        logging.warning("roles_config.json not found; role config will use .env fallbacks.")
+        return {}
+    except Exception as e:
+        logging.exception("Failed to read roles_config.json: %s", e)
+        return {}
+
+
+ROLE_CONFIG: dict[str, int] = _read_roles_config_raw()
+logging.info("Loaded %d roles from roles_config.json", len(ROLE_CONFIG))
+
+
+def get_role_id(name: str) -> int:
+    """
+    Lookup a role id by logical name.
+    1) Check roles_config.json
+    2) Fallback to .env-based IDs if present
+    """
+    key = name.strip().lower()
+    rid = ROLE_CONFIG.get(key)
+    if isinstance(rid, int) and rid > 0:
+        return rid
+
+    # Fallbacks from .env
+    fallback_map = {
+        "rustteam": RUST_ROLE_RUSTTEAM_ID,
+        "pvp": RUST_ROLE_PVP_ID,
+        "builder": RUST_ROLE_BUILDER_ID,
+        "farmer": RUST_ROLE_FARMER_ID,
+        "recruiter": RUST_ROLE_RECRUITER_ID,
+        "event_coord": RUST_ROLE_EVENT_COORD_ID,
+        "leadership": RUST_ROLE_LEADERSHIP_ID,
+        "active_duty": RUST_ROLE_ACTIVE_DUTY_ID,
+        "reserves": RUST_ROLE_RESERVES_ID,
+        "inactive_reserves": RUST_ROLE_INACTIVE_RESERVES_ID,
+        "visitor": RUST_ROLE_VISITOR_ID,
+    }
+
+    return int(fallback_map.get(key) or 0)
 
 
 def _read_connect_config_raw() -> list[dict]:
@@ -622,6 +682,37 @@ async def connect_reload(interaction: discord.Interaction):
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+@tree.command(description="Reload role configuration from roles_config.json.")
+async def roles_reload(interaction: discord.Interaction):
+    """Leadership-only: reload ROLE_CONFIG from disk."""
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    # Only leadership (and optionally recruiter / event_coord) can reload roles
+    allowed_role_ids = [
+        get_role_id("leadership"),
+        get_role_id("recruiter"),
+        get_role_id("event_coord"),
+    ]
+    if not user_has_any_role(interaction.user, allowed_role_ids):
+        await interaction.response.send_message(
+            "❌ You don't have permission to reload role configuration.",
+            ephemeral=True,
+        )
+        return
+
+    global ROLE_CONFIG
+    ROLE_CONFIG = _read_roles_config_raw()
+    await interaction.response.send_message(
+        f"✅ Reloaded **{len(ROLE_CONFIG)}** role mappings from `roles_config.json`.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(description="Add a new server profile to the /connect menu.")
 async def connect_add(
     interaction: discord.Interaction,
@@ -643,9 +734,9 @@ async def connect_add(
 
     # Permissions
     allowed_role_ids = [
-        RUST_ROLE_LEADERSHIP_ID,
-        RUST_ROLE_RECRUITER_ID,
-        RUST_ROLE_EVENT_COORD_ID,
+        get_role_id("leadership"),
+        get_role_id("recruiter"),
+        get_role_id("event_coord"),
     ]
     if not user_has_any_role(interaction.user, allowed_role_ids):
         await interaction.response.send_message(
@@ -722,9 +813,9 @@ async def connect_remove(
         return
 
     allowed_role_ids = [
-        RUST_ROLE_LEADERSHIP_ID,
-        RUST_ROLE_RECRUITER_ID,
-        RUST_ROLE_EVENT_COORD_ID,
+        get_role_id("leadership"),
+        get_role_id("recruiter"),
+        get_role_id("event_coord"),
     ]
     if not user_has_any_role(interaction.user, allowed_role_ids):
         await interaction.response.send_message(
@@ -786,9 +877,9 @@ async def connect_set_f1(
         return
 
     allowed_role_ids = [
-        RUST_ROLE_LEADERSHIP_ID,
-        RUST_ROLE_RECRUITER_ID,
-        RUST_ROLE_EVENT_COORD_ID,
+        get_role_id("leadership"),
+        get_role_id("recruiter"),
+        get_role_id("event_coord"),
     ]
     if not user_has_any_role(interaction.user, allowed_role_ids):
         await interaction.response.send_message(
@@ -1004,16 +1095,16 @@ async def hq(interaction: discord.Interaction, base_name: str = "Main"):
 
     # Permissions – reuse same roles as connect management
     allowed_role_ids = [
-        RUST_ROLE_LEADERSHIP_ID,
-        RUST_ROLE_RECRUITER_ID,
-        RUST_ROLE_EVENT_COORD_ID,
+        get_role_id("leadership"),
+        get_role_id("recruiter"),
+        get_role_id("event_coord"),
     ]
 
     try:
         has_perm = user_has_any_role(interaction.user, allowed_role_ids)
     except NameError:
         # If helper is missing for some reason, fall back to leadership only
-        allowed_role_ids = [RUST_ROLE_LEADERSHIP_ID]
+        allowed_role_ids = [get_role_id("leadership")]
         has_perm = any(
             (role.id in allowed_role_ids and role.id != 0)
             for role in interaction.user.roles
@@ -1050,6 +1141,112 @@ async def hq(interaction: discord.Interaction, base_name: str = "Main"):
         view=view,
         ephemeral=True,
     )
+
+
+@tree.command(description="Set a member's duty status (Active Duty / Reservist / Inactive Reservist).")
+@app_commands.describe(
+    member="Member to modify",
+    status="One of: active_duty, reservist, inactive_reservist"
+)
+async def status_set(interaction: discord.Interaction, member: discord.Member, status: str):
+    """Leadership-only: assign a member's duty status."""
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "This command can only be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+
+    allowed_role_ids = [get_role_id("leadership")]
+    if not user_has_any_role(interaction.user, allowed_role_ids):
+        await interaction.response.send_message(
+            "❌ You don't have permission to change duty statuses.",
+            ephemeral=True,
+        )
+        return
+
+    valid_statuses = {
+        "active_duty": get_role_id("active_duty"),
+        "reservist": get_role_id("reservist"),
+        "inactive_reservist": get_role_id("inactive_reservist"),
+    }
+
+    status = status.lower().strip()
+    if status not in valid_statuses:
+        await interaction.response.send_message(
+            "❌ Invalid status. Use: `active_duty`, `reservist`, `inactive_reservist`.",
+            ephemeral=True,
+        )
+        return
+
+    target_role_id = valid_statuses[status]
+    if target_role_id <= 0:
+        await interaction.response.send_message(
+            "❌ That status role is not configured yet. Update roles_config.json.",
+            ephemeral=True,
+        )
+        return
+
+    roles_to_remove = [
+        valid_statuses["active_duty"],
+        valid_statuses["reservist"],
+        valid_statuses["inactive_reservist"],
+    ]
+
+    for rid in roles_to_remove:
+        if rid <= 0:
+            continue
+        role = interaction.guild.get_role(rid)
+        if role and role in member.roles:
+            await member.remove_roles(role, reason="Changing duty status")
+
+    new_role = interaction.guild.get_role(target_role_id)
+    if not new_role:
+        await interaction.response.send_message(
+            "❌ Could not find the configured role in this guild.",
+            ephemeral=True,
+        )
+        return
+
+    await member.add_roles(new_role, reason="Duty status update")
+
+    pretty = status.replace("_", " ").title()
+    await interaction.response.send_message(
+        f"✅ **{member.display_name}** is now set to **{pretty}**.",
+        ephemeral=True,
+    )
+
+
+@tree.command(description="Show a member's current duty status.")
+async def status_info(interaction: discord.Interaction, member: discord.Member):
+    """Check what duty status a user currently has."""
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "This command can only be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+
+    statuses = {
+        "Active Duty": get_role_id("active_duty"),
+        "Reservist": get_role_id("reservist"),
+        "Inactive Reservist": get_role_id("inactive_reservist"),
+    }
+
+    user_status = "None Assigned"
+    for label, rid in statuses.items():
+        role = interaction.guild.get_role(rid)
+        if role and role in member.roles:
+            user_status = label
+            break
+
+    embed = discord.Embed(
+        title=f"Duty Status — {member.display_name}",
+        description=f"**{user_status}**",
+        color=discord.Color.blue(),
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ---------- INTERACTIVE MENU ----------

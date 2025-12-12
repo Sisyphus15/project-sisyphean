@@ -15,6 +15,7 @@ rust_config.
 rust_config.json
 rustplus.config.json
 rustplus.local.json
+roles_config.json
 raid_alert.py
 
 # Logs
