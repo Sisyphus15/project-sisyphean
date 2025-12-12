@@ -503,6 +503,56 @@ def get_role_id(name: str) -> int:
     return int(fallback_map.get(key) or 0)
 
 
+# ---------- DUTY STATUS HELPERS ----------
+
+DUTY_STATUS_KEYS = ["active_duty", "reservist", "inactive_reservist"]
+
+
+def get_duty_status_role_ids() -> dict[str, int]:
+    """Return mapping of duty status key -> role id (0 if missing)."""
+    return {key: get_role_id(key) for key in DUTY_STATUS_KEYS}
+
+
+async def apply_duty_status(guild: discord.Guild, member: discord.Member, status_key: str) -> str:
+    """
+    Core logic to change a member's duty status.
+    - status_key must be one of: 'active_duty', 'reservist', 'inactive_reservist'
+    - Removes all three duty status roles
+    - Adds the selected one
+    - Returns a pretty label for display
+    """
+    status_key = status_key.strip().lower()
+    if status_key not in DUTY_STATUS_KEYS:
+        raise ValueError("Invalid duty status key")
+
+    status_roles = get_duty_status_role_ids()
+    target_role_id = status_roles.get(status_key, 0)
+
+    if not guild:
+        raise ValueError("Guild is required to change duty status.")
+
+    if not target_role_id:
+        raise ValueError(f"No role configured for status '{status_key}'. Check roles_config.json.")
+
+    # Remove any existing duty status roles
+    for key, rid in status_roles.items():
+        if not rid:
+            continue
+        role = guild.get_role(rid)
+        if role and role in member.roles:
+            await member.remove_roles(role, reason="Changing duty status")
+
+    # Add the new status role
+    new_role = guild.get_role(target_role_id)
+    if not new_role:
+        raise ValueError(f"Role for status '{status_key}' not found in guild.")
+
+    await member.add_roles(new_role, reason="Duty status update")
+
+    # Nice human-readable label
+    return status_key.replace("_", " ").title()
+
+
 def _read_connect_config_raw() -> list[dict]:
     """Read the raw JSON list from CONNECT_CONFIG_PATH. Returns [] on error."""
     try:
@@ -1146,16 +1196,21 @@ async def hq(interaction: discord.Interaction, base_name: str = "Main"):
 @tree.command(description="Set a member's duty status (Active Duty / Reservist / Inactive Reservist).")
 @app_commands.describe(
     member="Member to modify",
-    status="One of: active_duty, reservist, inactive_reservist"
+    status="Select a duty status",
 )
-async def status_set(interaction: discord.Interaction, member: discord.Member, status: str):
+@app_commands.choices(
+    status=[
+        app_commands.Choice(name="Active Duty", value="active_duty"),
+        app_commands.Choice(name="Reservist", value="reservist"),
+        app_commands.Choice(name="Inactive Reservist", value="inactive_reservist"),
+    ]
+)
+async def status_set(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    status: app_commands.Choice[str],
+):
     """Leadership-only: assign a member's duty status."""
-    if not interaction.guild:
-        await interaction.response.send_message(
-            "This command can only be used inside a Discord server.",
-            ephemeral=True,
-        )
-        return
 
     allowed_role_ids = [get_role_id("leadership")]
     if not user_has_any_role(interaction.user, allowed_role_ids):
@@ -1165,52 +1220,24 @@ async def status_set(interaction: discord.Interaction, member: discord.Member, s
         )
         return
 
-    valid_statuses = {
-        "active_duty": get_role_id("active_duty"),
-        "reservist": get_role_id("reservist"),
-        "inactive_reservist": get_role_id("inactive_reservist"),
-    }
-
-    status = status.lower().strip()
-    if status not in valid_statuses:
+    if not interaction.guild:
         await interaction.response.send_message(
-            "❌ Invalid status. Use: `active_duty`, `reservist`, `inactive_reservist`.",
+            "This command can only be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
-    target_role_id = valid_statuses[status]
-    if target_role_id <= 0:
+    status_key = status.value  # "active_duty" / "reservist" / "inactive_reservist"
+
+    try:
+        pretty = await apply_duty_status(interaction.guild, member, status_key)
+    except ValueError as e:
         await interaction.response.send_message(
-            "❌ That status role is not configured yet. Update roles_config.json.",
+            f"❌ {e}",
             ephemeral=True,
         )
         return
 
-    roles_to_remove = [
-        valid_statuses["active_duty"],
-        valid_statuses["reservist"],
-        valid_statuses["inactive_reservist"],
-    ]
-
-    for rid in roles_to_remove:
-        if rid <= 0:
-            continue
-        role = interaction.guild.get_role(rid)
-        if role and role in member.roles:
-            await member.remove_roles(role, reason="Changing duty status")
-
-    new_role = interaction.guild.get_role(target_role_id)
-    if not new_role:
-        await interaction.response.send_message(
-            "❌ Could not find the configured role in this guild.",
-            ephemeral=True,
-        )
-        return
-
-    await member.add_roles(new_role, reason="Duty status update")
-
-    pretty = status.replace("_", " ").title()
     await interaction.response.send_message(
         f"✅ **{member.display_name}** is now set to **{pretty}**.",
         ephemeral=True,
@@ -1227,17 +1254,20 @@ async def status_info(interaction: discord.Interaction, member: discord.Member):
         )
         return
 
-    statuses = {
-        "Active Duty": get_role_id("active_duty"),
-        "Reservist": get_role_id("reservist"),
-        "Inactive Reservist": get_role_id("inactive_reservist"),
+    status_roles = get_duty_status_role_ids()
+    label_map = {
+        "active_duty": "Active Duty",
+        "reservist": "Reservist",
+        "inactive_reservist": "Inactive Reservist",
     }
-
     user_status = "None Assigned"
-    for label, rid in statuses.items():
+
+    for key, rid in status_roles.items():
+        if not rid:
+            continue
         role = interaction.guild.get_role(rid)
         if role and role in member.roles:
-            user_status = label
+            user_status = label_map.get(key, key.replace("_", " ").title())
             break
 
     embed = discord.Embed(
@@ -1474,6 +1504,89 @@ class HQView(discord.ui.View):
         button: discord.ui.Button,
     ):
         await run_tc_status(interaction, "tc_main")
+
+    # ---- ROW 4: DUTY STATUS (SELF) ----
+
+    @discord.ui.button(label="Set Active Duty", style=discord.ButtonStyle.success, emoji="🟢")
+    async def set_active_duty_btn(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This button can only be used inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            pretty = await apply_duty_status(interaction.guild, interaction.user, "active_duty")
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"❌ {e}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"✅ Your duty status is now **{pretty}**.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Set Reservist", style=discord.ButtonStyle.secondary, emoji="🟡")
+    async def set_reservist_btn(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This button can only be used inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            pretty = await apply_duty_status(interaction.guild, interaction.user, "reservist")
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"❌ {e}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"✅ Your duty status is now **{pretty}**.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Set Inactive Reservist", style=discord.ButtonStyle.danger, emoji="🔴")
+    async def set_inactive_reservist_btn(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This button can only be used inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            pretty = await apply_duty_status(interaction.guild, interaction.user, "inactive_reservist")
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"❌ {e}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"✅ Your duty status is now **{pretty}**.",
+            ephemeral=True,
+        )
 
 
 # ---------- ENTRY POINT ----------
