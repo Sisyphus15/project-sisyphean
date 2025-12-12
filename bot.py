@@ -1449,16 +1449,16 @@ async def status_audit(interaction: discord.Interaction):
                 untouched += 1
                 continue
 
-        try:
-            old_label = actual_label
-            new_label = pretty_status_label(recorded)
-            await apply_duty_status(
-                guild,
-                member,
-                recorded,
-                actor=interaction.user,
-                source="status_audit",
-            )
+            try:
+                old_label = actual_label
+                new_label = pretty_status_label(recorded)
+                await apply_duty_status(
+                    guild,
+                    member,
+                    recorded,
+                    actor=interaction.user,
+                    source="status_audit",
+                )
                 reset_to_recorded += 1
                 enforced_entries.append(
                     f"- {member.mention} — **{old_label}** → **{new_label}**"
