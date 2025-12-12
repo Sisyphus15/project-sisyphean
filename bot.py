@@ -6,6 +6,7 @@ import json
 import urllib.request
 import urllib.error
 from functools import partial
+from typing import Any
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -448,13 +449,17 @@ DUTY_STATUS_STATE_PATH = os.getenv("DUTY_STATUS_STATE_PATH") or os.path.join(BAS
 
 # ---------- ROLE CONFIG ----------
 
-def _read_roles_config_raw() -> dict[str, int]:
-    """Read roles_config.json, flatten nested categories, return {name: id}."""
+def norm_key(s: str) -> str:
+    """Normalize a role key for consistent lookups."""
+    return str(s or "").strip().lower().replace(" ", "_").replace("-", "_")
 
-    def normalize(key: str) -> str:
-        return str(key or "").strip().lower()
 
-    def store(cleaned: dict[str, int], path: tuple[str, ...], raw_value: object) -> None:
+def _read_roles_config_raw() -> dict[str, Any]:
+    """Read roles_config.json, flatten nested categories, return {name: id/raw}."""
+
+    passthrough_keys = {"_ROLE_RENAMES", "_B_BILLETS"}
+
+    def store(cleaned: dict[str, Any], path: tuple[str, ...], raw_value: object) -> None:
         label = ".".join(path)
         try:
             role_id = int(raw_value)
@@ -462,23 +467,36 @@ def _read_roles_config_raw() -> dict[str, int]:
             logging.warning("Invalid role id for %s in roles_config.json: %r", label, raw_value)
             return
 
-        # Allow lookups by the leaf key as well as the dotted/underscored path.
-        keys = {normalize(path[-1])}
-        if len(path) > 1:
-            keys.add(normalize(label))
-            keys.add(normalize("_".join(path)))
+        # Allow lookups by the leaf key as well as dotted/underscored paths.
+        keys = {
+            norm_key(path[-1]),
+            norm_key(label),
+            norm_key("_".join(path)),
+        }
         for key in keys:
             cleaned[key] = role_id
 
-    def flatten(obj: object, prefix: tuple[str, ...] | None = None, cleaned: dict[str, int] | None = None) -> dict[str, int]:
+    def flatten(
+        obj: object,
+        prefix: tuple[str, ...] | None = None,
+        cleaned: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         prefix = prefix or tuple()
         cleaned = cleaned or {}
         if not isinstance(obj, dict):
-            logging.warning("roles_config.json must be a JSON object; ignoring invalid entry at %s", ".".join(prefix) or "root")
+            logging.warning(
+                "roles_config.json must be a JSON object; ignoring invalid entry at %s",
+                ".".join(prefix) or "root",
+            )
             return cleaned
         for raw_key, value in obj.items():
             key = str(raw_key).strip()
             if not key:
+                continue
+            passthrough_key = key.upper()
+            if passthrough_key in passthrough_keys:
+                cleaned[passthrough_key] = value
+                cleaned[key] = value
                 continue
             path = prefix + (key,)
             if isinstance(value, dict):
@@ -502,37 +520,42 @@ def _read_roles_config_raw() -> dict[str, int]:
         return {}
 
 
-ROLE_CONFIG: dict[str, int] = _read_roles_config_raw()
+ROLE_CONFIG: dict[str, Any] = _read_roles_config_raw()
 logging.info("Loaded %d roles from roles_config.json", len(ROLE_CONFIG))
+
+_RAW_ROLE_RENAMES = ROLE_CONFIG.get("_ROLE_RENAMES")
+if isinstance(_RAW_ROLE_RENAMES, dict):
+    ROLE_RENAMES: dict[str, list[str]] = {
+        norm_key(k): [norm_key(x) for x in v if isinstance(x, str)]
+        for k, v in _RAW_ROLE_RENAMES.items()
+        if isinstance(v, list)
+    }
+else:
+    ROLE_RENAMES = {}
+
+_RAW_B_BILLETS = ROLE_CONFIG.get("_B_BILLETS")
+if isinstance(_RAW_B_BILLETS, list):
+    B_BILLET_KEYS: list[str] = [norm_key(x) for x in _RAW_B_BILLETS if isinstance(x, str)]
+else:
+    B_BILLET_KEYS = []
 
 
 def get_role_id(name: str) -> int:
     """
     Lookup a role id by logical name.
-    1) Check roles_config.json
-    2) Fallback to .env-based IDs if present
     """
-    key = name.strip().lower()
+    key = norm_key(name)
+
     rid = ROLE_CONFIG.get(key)
     if isinstance(rid, int) and rid > 0:
         return rid
 
-    # Fallbacks from .env
-    fallback_map = {
-        "rustteam": RUST_ROLE_RUSTTEAM_ID,
-        "pvp": RUST_ROLE_PVP_ID,
-        "builder": RUST_ROLE_BUILDER_ID,
-        "farmer": RUST_ROLE_FARMER_ID,
-        "recruiter": RUST_ROLE_RECRUITER_ID,
-        "event_coord": RUST_ROLE_EVENT_COORD_ID,
-        "leadership": RUST_ROLE_LEADERSHIP_ID,
-        "active_duty": RUST_ROLE_ACTIVE_DUTY_ID,
-        "reserves": RUST_ROLE_RESERVES_ID,
-        "inactive_reserves": RUST_ROLE_INACTIVE_RESERVES_ID,
-        "visitor": RUST_ROLE_VISITOR_ID,
-    }
+    for alias in ROLE_RENAMES.get(key, []):
+        rid2 = ROLE_CONFIG.get(alias)
+        if isinstance(rid2, int) and rid2 > 0:
+            return rid2
 
-    return int(fallback_map.get(key) or 0)
+    return 0
 
 
 # ---------- DUTY STATUS HELPERS ----------
@@ -543,6 +566,16 @@ DUTY_STATUS_KEYS = ["active_duty", "reservist", "inactive_reservist"]
 def get_duty_status_role_ids() -> dict[str, int]:
     """Return mapping of duty status key -> role id (0 if missing)."""
     return {key: get_role_id(key) for key in DUTY_STATUS_KEYS}
+
+
+def get_b_billet_role_ids() -> list[int]:
+    """Return configured B Billet role ids."""
+    ids: list[int] = []
+    for key in B_BILLET_KEYS:
+        rid = get_role_id(key)
+        if rid:
+            ids.append(rid)
+    return ids
 
 
 async def apply_duty_status(

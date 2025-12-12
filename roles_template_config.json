@@ -1,41 +1,37 @@
 {
-  "_ADMIN": {
-    "Valerian_Administrator": "",
-    "Valerian_Moderator": "",
-    "Leadership": "",
-    "IGL": "",
-    "US_Military": "",
-    "Valeria_Supporter": ""
+  "_ROLE_RENAMES": {
+    "pvp": ["Infantryman", "infantryman"],
+    "builder": ["Combat_Engineer", "combat engineer"],
+    "electrician": ["Lineman", "lineman"],
+    "farmer": ["Field_Sustainment", "field sustainment"],
+    "ftl": ["Squad_Leader", "squad leader"],
+    "event_coord": ["Operations_Officer", "operations officer"],
+    "training_officer": ["Instructor", "instructor"],
+    "rust_recruiter": ["Recruiter", "recruiter"]
   },
 
-  "_APPLICATIONS": {
-    "Rust_Team": "",
-    "Rust_Denied": "",
-    "Pending_Application": "",
-    "Rust_Application": "",
-    "VISITOR": ""
-  },
+  "_B_BILLETS": [
+    "squad_leader",
+    "operations_officer",
+    "instructor",
+    "recruiter",
+    "section_chief"
+  ],
 
-  "_DUTY_STATUS": {
-    "Active_Duty": "",
-    "Reservist": "",
-    "Inactive_Reservist": ""
-  },
+  "infantryman": 111111111111111111,
+  "combat_engineer": 222222222222222222,
+  "lineman": 333333333333333333,
+  "field_sustainment": 444444444444444444,
 
-  "_BILLETS": {
-    "Instructor": "",
-    "Operations_Officer": "",
-    "Section_Chief": "",
-    "Squad_Leader": "",
-    "Recruiter": ""
-  },
+  "squad_leader": 555555555555555555,
+  "operations_officer": 666666666666666666,
+  "instructor": 777777777777777777,
+  "recruiter": 888888888888888888,
+  "section_chief": 999999999999999999,
 
-  "_MOS": {
-    "Infantryman": "",
-    "Combat_Engineer": "",
-    "Botanist": "",
-    "Lineman": "",
-    "Field_Sustainment": ""
-  }
+  "active_duty": 123,
+  "reservist": 456,
+  "inactive_reservist": 789,
 
+  "leadership": 1010101010
 }
