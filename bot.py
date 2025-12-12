@@ -920,11 +920,8 @@ async def hq_status(interaction: discord.Interaction):
         await interaction.followup.send(f"❌ Failed to get HQ switch status: {msg}", ephemeral=True)
 
 
-@tree.command(description="Check TC upkeep and core resources.")
-@app_commands.describe(
-    tc_name="TC entity name from rust_config.json (e.g., tc_main, tcm_ext_n)"
-)
-async def tc_status(interaction: discord.Interaction, tc_name: str = "tc_main"):
+async def run_tc_status(interaction: discord.Interaction, tc_name: str = "tc_main"):
+    """Shared logic for responding with TC upkeep and resource status."""
     # Defer since we have to call over HTTP
     await interaction.response.defer(ephemeral=True)
 
@@ -980,6 +977,15 @@ async def tc_status(interaction: discord.Interaction, tc_name: str = "tc_main"):
     embed.set_footer(text="Stay alert, stay alive.")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(description="Check TC upkeep and core resources.")
+@app_commands.describe(
+    tc_name="TC entity name from rust_config.json (e.g., tc_main, tcm_ext_n)"
+)
+async def tc_status(interaction: discord.Interaction, tc_name: str = "tc_main"):
+    """Slash command wrapper that calls the shared TC status handler."""
+    await run_tc_status(interaction, tc_name)
 
 
 @tree.command(description="Open the HQ command console for leadership.")
@@ -1261,7 +1267,8 @@ class HQView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
-        await handle_entity_status(interaction, "switch_hq", "status")
+        # helper signature is handle_entity_status(interaction, entity_key)
+        await handle_entity_status(interaction, "switch_hq")
 
     @discord.ui.button(label="TC Status", style=discord.ButtonStyle.primary, emoji="🏛")
     async def tc_status_btn(
@@ -1269,8 +1276,7 @@ class HQView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
-        # Reuse your tc_status helper (takes interaction + tc_name)
-        await tc_status(interaction, "tc_main")
+        await run_tc_status(interaction, "tc_main")
 
 
 # ---------- ENTRY POINT ----------
@@ -1278,4 +1284,3 @@ class HQView(discord.ui.View):
 if __name__ == "__main__":
     logging.info("Starting Project Sisyphean bot...")
     bot.run(DISCORD_TOKEN)
-
