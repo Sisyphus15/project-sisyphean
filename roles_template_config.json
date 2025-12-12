@@ -1,0 +1,41 @@
+{
+  "_ADMIN": {
+    "Valerian_Administrator": "",
+    "Valerian_Moderator": "",
+    "Leadership": "",
+    "IGL": "",
+    "US_Military": "",
+    "Valeria_Supporter": ""
+  },
+
+  "_APPLICATIONS": {
+    "Rust_Team": "",
+    "Rust_Denied": "",
+    "Pending_Application": "",
+    "Rust_Application": "",
+    "VISITOR": ""
+  },
+
+  "_DUTY_STATUS": {
+    "Active_Duty": "",
+    "Reservist": "",
+    "Inactive_Reservist": ""
+  },
+
+  "_BILLETS": {
+    "Instructor": "",
+    "Operations_Officer": "",
+    "Section_Chief": "",
+    "Squad_Leader": "",
+    "Recruiter": ""
+  },
+
+  "_MOS": {
+    "Infantryman": "",
+    "Combat_Engineer": "",
+    "Botanist": "",
+    "Lineman": "",
+    "Field_Sustainment": ""
+  }
+
+}

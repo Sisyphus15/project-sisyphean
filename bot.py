@@ -449,20 +449,50 @@ DUTY_STATUS_STATE_PATH = os.getenv("DUTY_STATUS_STATE_PATH") or os.path.join(BAS
 # ---------- ROLE CONFIG ----------
 
 def _read_roles_config_raw() -> dict[str, int]:
-    """Read roles_config.json, return {name: id} or {} on error."""
+    """Read roles_config.json, flatten nested categories, return {name: id}."""
+
+    def normalize(key: str) -> str:
+        return str(key or "").strip().lower()
+
+    def store(cleaned: dict[str, int], path: tuple[str, ...], raw_value: object) -> None:
+        label = ".".join(path)
+        try:
+            role_id = int(raw_value)
+        except (TypeError, ValueError):
+            logging.warning("Invalid role id for %s in roles_config.json: %r", label, raw_value)
+            return
+
+        # Allow lookups by the leaf key as well as the dotted/underscored path.
+        keys = {normalize(path[-1])}
+        if len(path) > 1:
+            keys.add(normalize(label))
+            keys.add(normalize("_".join(path)))
+        for key in keys:
+            cleaned[key] = role_id
+
+    def flatten(obj: object, prefix: tuple[str, ...] | None = None, cleaned: dict[str, int] | None = None) -> dict[str, int]:
+        prefix = prefix or tuple()
+        cleaned = cleaned or {}
+        if not isinstance(obj, dict):
+            logging.warning("roles_config.json must be a JSON object; ignoring invalid entry at %s", ".".join(prefix) or "root")
+            return cleaned
+        for raw_key, value in obj.items():
+            key = str(raw_key).strip()
+            if not key:
+                continue
+            path = prefix + (key,)
+            if isinstance(value, dict):
+                flatten(value, path, cleaned)
+            else:
+                store(cleaned, path, value)
+        return cleaned
+
     try:
         with open(ROLES_CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict):
-                # normalize to int where possible
-                cleaned: dict[str, int] = {}
-                for k, v in data.items():
-                    try:
-                        cleaned[str(k).strip().lower()] = int(v)
-                    except (TypeError, ValueError):
-                        logging.warning("Invalid role id for %s in roles_config.json: %r", k, v)
-                return cleaned
-            logging.warning("roles_config.json is not an object; ignoring.")
+                return flatten(data)
+            logging.warning("roles_config.json root is not an object; ignoring.")
             return {}
     except FileNotFoundError:
         logging.warning("roles_config.json not found; role config will use .env fallbacks.")
