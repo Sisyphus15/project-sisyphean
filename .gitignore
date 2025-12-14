@@ -18,6 +18,7 @@ rustplus.local.json
 roles_config.json
 raid_alert.py
 duty_status.json
+staff_config.json
 
 # Logs
 *.log

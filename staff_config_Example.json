@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "notes": "Fill these role IDs from your Discord server. If a permission list is empty, permissions fail-closed (DENIED).",
+  "permissions": {
+    "rust_control": [0],
+    "staff_manage": [0],
+    "promote_demote": [0]
+  }
+}

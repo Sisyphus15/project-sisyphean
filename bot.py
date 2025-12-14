@@ -856,19 +856,33 @@ async def base_offline(interaction: discord.Interaction, base_name: str = "Main"
 
 @tree.command(description="Open a menu of Rust servers to connect to (F1 console commands).")
 async def connect(interaction: discord.Interaction):
-    if not CONNECT_PROFILES:
-        await interaction.response.send_message(
-            "No connect profiles are configured yet. Ask staff to update `connect_servers.json`.",
+    await interaction.response.defer(ephemeral=True)
+    try:
+        if not CONNECT_PROFILES:
+            await interaction.followup.send(
+                "No connect profiles are configured yet. Ask staff to update `connect_servers.json`.",
+                ephemeral=True,
+            )
+            return
+
+        view = ConnectMenuView(CONNECT_PROFILES)
+        await interaction.followup.send(
+            "Select a server to get its F1 connect command:",
+            view=view,
             ephemeral=True,
         )
-        return
-
-    view = ConnectMenuView(CONNECT_PROFILES)
-    await interaction.response.send_message(
-        "Select a server to get its F1 connect command:",
-        view=view,
-        ephemeral=True,
-    )
+    except Exception:
+        logging.exception("Failed to handle /connect interaction")
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                "⚠️ Connect failed. Check logs.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "⚠️ Connect failed. Check logs.",
+                ephemeral=True,
+            )
 
 
 @tree.command(description="Reload /connect server profiles from the config file.")

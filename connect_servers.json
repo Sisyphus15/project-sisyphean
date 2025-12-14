@@ -54,5 +54,10 @@
     "category": "Wipe",
     "emoji": "🇺🇸",
     "notes": "Monthly"
+  },
+  {
+    "key": "f1",
+    "label": "d'",
+    "f1": "client.connect USLarge.Rustopia.gg:28015"
   }
 ]
