@@ -358,11 +358,11 @@ class ConnectMenuView(discord.ui.View):
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
-        if self.message:
-            try:
+        try:
+            if self.message:
                 await self.message.edit(view=self)
-            except Exception:
-                logging.exception("Failed to disable /connect view on timeout")
+        except Exception:
+            logging.exception("Failed to disable ConnectMenuView on timeout")
 
 def is_leadership():
     """App command check: allow leadership role or server admins."""
@@ -881,6 +881,7 @@ async def connect(interaction: discord.Interaction):
             "Select a server to get its F1 connect command:",
             view=view,
             ephemeral=True,
+            wait=True,
         )
         view.message = message
     except Exception:
