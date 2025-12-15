@@ -320,10 +320,11 @@ class ConnectSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         key = self.values[0]
         profile = CONNECT_PROFILE_INDEX.get(key)
         if not profile:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ That server profile could not be found. Ask an admin to refresh the config.",
                 ephemeral=True,
             )
@@ -333,7 +334,7 @@ class ConnectSelect(discord.ui.Select):
         label = profile.get("label", key)
 
         if not f1:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ No F1 connect string defined for **{label}**.",
                 ephemeral=True,
             )
@@ -344,14 +345,24 @@ class ConnectSelect(discord.ui.Select):
             "Copy & paste this into your Rust F1 console:\n"
             f"```{f1}```"
         )
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=True)
 
 
 class ConnectMenuView(discord.ui.View):
-    def __init__(self, profiles: list[dict], timeout: float | None = 120.0):
+    def __init__(self, profiles: list[dict], timeout: float | None = 1800.0):
         super().__init__(timeout=timeout)
+        self.message: discord.Message | None = None
         if profiles:
             self.add_item(ConnectSelect(profiles))
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                logging.exception("Failed to disable /connect view on timeout")
 
 def is_leadership():
     """App command check: allow leadership role or server admins."""
@@ -866,11 +877,12 @@ async def connect(interaction: discord.Interaction):
             return
 
         view = ConnectMenuView(CONNECT_PROFILES)
-        await interaction.followup.send(
+        message = await interaction.followup.send(
             "Select a server to get its F1 connect command:",
             view=view,
             ephemeral=True,
         )
+        view.message = message
     except Exception:
         logging.exception("Failed to handle /connect interaction")
         if interaction.response.is_done():
