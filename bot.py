@@ -13,6 +13,8 @@ from discord import app_commands
 from dotenv import load_dotenv
 import aiohttp
 import json
+from audit_logger import audit_log
+from permissions import has_permission
 
 
 # ---------- ENV + CONFIG + LOGGING ----------
@@ -363,6 +365,31 @@ class ConnectMenuView(discord.ui.View):
                 await self.message.edit(view=self)
         except Exception:
             logging.exception("Failed to disable ConnectMenuView on timeout")
+
+
+async def _send_permission_message(interaction: discord.Interaction, message: str):
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+async def ensure_rust_permission(interaction: discord.Interaction) -> bool:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await _send_permission_message(
+            interaction,
+            "This control can only be used inside a server.",
+        )
+        return False
+
+    if not has_permission(interaction, "rust_control"):
+        await _send_permission_message(
+            interaction,
+            "⛔ You don't have permission to control base systems.",
+        )
+        return False
+
+    return True
 
 def is_leadership():
     """App command check: allow leadership role or server admins."""
@@ -1178,6 +1205,15 @@ async def connect_set_f1(
 
 @tree.command(description="Turn MAIN SAM site ON (via smart switch).")
 async def sam_on(interaction: discord.Interaction):
+    if not await ensure_rust_permission(interaction):
+        return
+
+    audit_log(
+        "rust_control",
+        interaction.user,
+        {"command": "sam_on"},
+    )
+
     await interaction.response.defer(ephemeral=True)
     ok, msg = await call_entity_action("sam_main", "on")
     if ok:
@@ -1188,6 +1224,15 @@ async def sam_on(interaction: discord.Interaction):
 
 @tree.command(description="Turn MAIN SAM site OFF (via smart switch).")
 async def sam_off(interaction: discord.Interaction):
+    if not await ensure_rust_permission(interaction):
+        return
+
+    audit_log(
+        "rust_control",
+        interaction.user,
+        {"command": "sam_off"},
+    )
+
     await interaction.response.defer(ephemeral=True)
     ok, msg = await call_entity_action("sam_main", "off")
     if ok:
@@ -1198,6 +1243,15 @@ async def sam_off(interaction: discord.Interaction):
 
 @tree.command(description="Check MAIN SAM smart switch status.")
 async def sam_status(interaction: discord.Interaction):
+    if not await ensure_rust_permission(interaction):
+        return
+
+    audit_log(
+        "rust_control",
+        interaction.user,
+        {"command": "sam_status"},
+    )
+
     await interaction.response.defer(ephemeral=True)
     ok, msg = await call_entity_action("sam_main", "status")
     if ok:
@@ -1208,21 +1262,54 @@ async def sam_status(interaction: discord.Interaction):
 
 @tree.command(description="Turn MAIN SAM site ON via Rust+.")
 async def sam_main_on(interaction: discord.Interaction):
+    if not await ensure_rust_permission(interaction):
+        return
+
+    audit_log(
+        "rust_control",
+        interaction.user,
+        {"command": "sam_main_on"},
+    )
     await handle_entity_action(interaction, "sam_main", "on")
 
 
 @tree.command(description="Turn MAIN SAM site OFF via Rust+.")
 async def sam_main_off(interaction: discord.Interaction):
+    if not await ensure_rust_permission(interaction):
+        return
+
+    audit_log(
+        "rust_control",
+        interaction.user,
+        {"command": "sam_main_off"},
+    )
     await handle_entity_action(interaction, "sam_main", "off")
 
 
 @tree.command(description="Check MAIN SAM site status via Rust+.")
 async def sam_main_status(interaction: discord.Interaction):
+    if not await ensure_rust_permission(interaction):
+        return
+
+    audit_log(
+        "rust_control",
+        interaction.user,
+        {"command": "sam_main_status"},
+    )
     await handle_entity_status(interaction, "sam_main")
 
 
 @tree.command(description="Turn HQ main switch ON.")
 async def hq_on(interaction: discord.Interaction):
+    if not await ensure_rust_permission(interaction):
+        return
+
+    audit_log(
+        "rust_control",
+        interaction.user,
+        {"command": "hq_on"},
+    )
+
     await interaction.response.defer(ephemeral=True)
     ok, msg = await call_entity_action("switch_hq", "on")
     if ok:
@@ -1233,6 +1320,15 @@ async def hq_on(interaction: discord.Interaction):
 
 @tree.command(description="Turn HQ main switch OFF.")
 async def hq_off(interaction: discord.Interaction):
+    if not await ensure_rust_permission(interaction):
+        return
+
+    audit_log(
+        "rust_control",
+        interaction.user,
+        {"command": "hq_off"},
+    )
+
     await interaction.response.defer(ephemeral=True)
     ok, msg = await call_entity_action("switch_hq", "off")
     if ok:
@@ -1243,6 +1339,15 @@ async def hq_off(interaction: discord.Interaction):
 
 @tree.command(description="Check HQ main switch status.")
 async def hq_status(interaction: discord.Interaction):
+    if not await ensure_rust_permission(interaction):
+        return
+
+    audit_log(
+        "rust_control",
+        interaction.user,
+        {"command": "hq_status"},
+    )
+
     await interaction.response.defer(ephemeral=True)
     ok, msg = await call_entity_action("switch_hq", "status")
     if ok:
@@ -1814,7 +1919,15 @@ class HQView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
-        # Uses your existing Rust+ helper
+        if not await ensure_rust_permission(interaction):
+            return
+
+        audit_log(
+            "rust_control",
+            interaction.user,
+            {"command": "sam_on_button", "base": self.base_name},
+        )
+
         await handle_entity_action(interaction, "sam_main", "on")
 
     @discord.ui.button(label="MAIN SAM OFF", style=discord.ButtonStyle.secondary, emoji="🛰")
@@ -1823,6 +1936,14 @@ class HQView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
+        if not await ensure_rust_permission(interaction):
+            return
+
+        audit_log(
+            "rust_control",
+            interaction.user,
+            {"command": "sam_off_button", "base": self.base_name},
+        )
         await handle_entity_action(interaction, "sam_main", "off")
 
     @discord.ui.button(label="SAM Status", style=discord.ButtonStyle.secondary, emoji="ℹ️")
@@ -1831,6 +1952,14 @@ class HQView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
+        if not await ensure_rust_permission(interaction):
+            return
+
+        audit_log(
+            "rust_control",
+            interaction.user,
+            {"command": "sam_status_button", "base": self.base_name},
+        )
         await handle_entity_status(interaction, "sam_main")
 
     # ---- ROW 3: HQ POWER + TC STATUS ----
@@ -1841,6 +1970,14 @@ class HQView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
+        if not await ensure_rust_permission(interaction):
+            return
+
+        audit_log(
+            "rust_control",
+            interaction.user,
+            {"command": "hq_on_button", "base": self.base_name},
+        )
         await handle_entity_action(interaction, "switch_hq", "on")
 
     @discord.ui.button(label="HQ OFF", style=discord.ButtonStyle.secondary, emoji="🔌")
@@ -1849,6 +1986,14 @@ class HQView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
+        if not await ensure_rust_permission(interaction):
+            return
+
+        audit_log(
+            "rust_control",
+            interaction.user,
+            {"command": "hq_off_button", "base": self.base_name},
+        )
         await handle_entity_action(interaction, "switch_hq", "off")
 
     @discord.ui.button(label="HQ Status", style=discord.ButtonStyle.secondary, emoji="ℹ️")
@@ -1857,6 +2002,14 @@ class HQView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
+        if not await ensure_rust_permission(interaction):
+            return
+
+        audit_log(
+            "rust_control",
+            interaction.user,
+            {"command": "hq_status_button", "base": self.base_name},
+        )
         # helper signature is handle_entity_status(interaction, entity_key)
         await handle_entity_status(interaction, "switch_hq")
 
