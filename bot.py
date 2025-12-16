@@ -349,7 +349,7 @@ class ConnectSelect(discord.ui.Select):
 
 
 class ConnectMenuView(discord.ui.View):
-    def __init__(self, profiles: list[dict], timeout: float | None = 1800.0):
+    def __init__(self, profiles: list[dict], timeout: float | None = 300.0):
         super().__init__(timeout=timeout)
         self.message: discord.Message | None = None
         if profiles:
