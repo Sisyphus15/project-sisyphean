@@ -59,5 +59,13 @@
     "key": "f1",
     "label": "d'",
     "f1": "client.connect USLarge.Rustopia.gg:28015"
+  },
+  {
+    "key": "PVP",
+    "label": "UKN.GG - US Training Grounds - Medium II",
+    "f1": "client.connect 64.40.8.178:28014",
+    "category": "Training",
+    "emoji": "🎯",
+    "notes": "Clan PvP Tryouts"
   }
 ]
