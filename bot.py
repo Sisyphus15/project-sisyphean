@@ -15,6 +15,7 @@ import aiohttp
 import json
 from audit_logger import audit_log
 from permissions import has_permission
+from audit_discord import post_audit_to_channel
 
 
 # ---------- ENV + CONFIG + LOGGING ----------
@@ -811,6 +812,51 @@ def load_connect_profiles():
 CONNECT_PROFILES, CONNECT_PROFILE_INDEX = load_connect_profiles()
 
 
+# ---------- STAFF CONFIG HELPERS ----------
+
+STAFF_CONFIG_PATH = os.path.join(BASE_DIR, "staff_config.json")
+
+
+def load_staff_config() -> dict:
+    try:
+        with open(STAFF_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logging.exception("Failed to load staff_config.json: %s", e)
+        return {}
+
+
+def staff_roles_cfg() -> dict:
+    return load_staff_config().get("roles", {})
+
+
+def flatten_unit_roles(roles_cfg: dict) -> list[int]:
+    units = roles_cfg.get("units", {})
+    role_ids: list[int] = []
+    for category, mapping in units.items():
+        for name, rid in (mapping or {}).items():
+            if isinstance(rid, int) and rid:
+                role_ids.append(rid)
+    return role_ids
+
+
+def leadership_role_ids(roles_cfg: dict) -> list[int]:
+    lead = roles_cfg.get("leadership", {})
+    return [rid for rid in lead.values() if isinstance(rid, int) and rid]
+
+
+def status_role_id(roles_cfg: dict, key: str) -> int:
+    return int(roles_cfg.get("status", {}).get(key, 0) or 0)
+
+
+def find_role(guild: discord.Guild, role_id: int) -> discord.Role | None:
+    if not role_id:
+        return None
+    return guild.get_role(role_id)
+
+
 # ---------- SLASH COMMANDS ----------
 
 @tree.command(description="Check if the bot is online.")
@@ -1199,6 +1245,258 @@ async def connect_set_f1(
         f"✅ Updated F1 connect string for profile `{key}`.",
         ephemeral=True,
     )
+
+
+staff_group = app_commands.Group(name="staff", description="Staff management commands")
+
+
+async def unit_autocomplete(interaction: discord.Interaction, current: str):
+    cfg = staff_roles_cfg()
+    units = cfg.get("units", {})
+    choices: list[app_commands.Choice[str]] = []
+
+    for category, mapping in units.items():
+        for unit_name, rid in (mapping or {}).items():
+            if not rid:
+                continue
+            label = f"{category}: {unit_name}"
+            if current.lower() in label.lower():
+                choices.append(app_commands.Choice(name=label, value=str(rid)))
+
+    return choices[:25]
+
+
+async def leader_autocomplete(interaction: discord.Interaction, current: str):
+    cfg = staff_roles_cfg()
+    lead = cfg.get("leadership", {})
+    choices: list[app_commands.Choice[str]] = []
+    for key, rid in (lead or {}).items():
+        if not rid:
+            continue
+        label = key.replace("_", " ").title()
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label, value=str(rid)))
+    return choices[:25]
+
+
+@staff_group.command(name="roster", description="Show the current formation roster (HQ + Guns).")
+async def staff_roster(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Server-only command.", ephemeral=True)
+        return
+    if not has_permission(interaction, "staff_manage"):
+        await interaction.response.send_message("⛔ Staff only.", ephemeral=True)
+        return
+
+    cfg = staff_roles_cfg()
+    units = cfg.get("units", {})
+    lead_ids = leadership_role_ids(cfg)
+
+    lines = ["**📋 Staff Roster (Formation View)**"]
+    for category, mapping in units.items():
+        lines.append(f"\n__**{category}**__")
+        for unit_name, rid in (mapping or {}).items():
+            role = find_role(interaction.guild, int(rid or 0))
+            if not role:
+                continue
+
+            members = sorted(role.members, key=lambda m: m.display_name.lower())
+            if not members:
+                continue
+
+            rendered = []
+            for m in members:
+                is_lead = any(r.id in lead_ids for r in m.roles)
+                rendered.append(f"{'🧭' if is_lead else '•'} {m.mention}")
+
+            lines.append(f"**{unit_name}** ({len(members)}): " + ", ".join(rendered))
+
+    await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+
+@staff_group.command(name="assign", description="Assign a user to a unit (strips other unit roles first).")
+@app_commands.describe(member="Member to assign", unit="Unit to assign them to")
+@app_commands.autocomplete(unit=unit_autocomplete)
+async def staff_assign(interaction: discord.Interaction, member: discord.Member, unit: str):
+    if not interaction.guild:
+        await interaction.response.send_message("Server-only command.", ephemeral=True)
+        return
+    if not has_permission(interaction, "staff_manage"):
+        await interaction.response.send_message("⛔ Staff only.", ephemeral=True)
+        return
+
+    roles_cfg = staff_roles_cfg()
+    unit_role_id = int(unit)
+
+    to_remove = []
+    for rid in flatten_unit_roles(roles_cfg):
+        r = find_role(interaction.guild, rid)
+        if r and r in member.roles:
+            to_remove.append(r)
+
+    target_role = find_role(interaction.guild, unit_role_id)
+    if not target_role:
+        await interaction.response.send_message("⚠️ That unit role is not configured or not found.", ephemeral=True)
+        return
+
+    try:
+        if to_remove:
+            await member.remove_roles(*to_remove, reason=f"Staff assign by {interaction.user}")
+        await member.add_roles(target_role, reason=f"Staff assign by {interaction.user}")
+
+        member_role_id = status_role_id(roles_cfg, "member")
+        member_role = find_role(interaction.guild, member_role_id)
+        if member_role and member_role not in member.roles:
+            await member.add_roles(member_role, reason="Ensure member status")
+
+        entry = audit_log(
+            "staff_assign",
+            interaction.user,
+            {"target_id": member.id, "target": str(member), "unit_role_id": unit_role_id, "unit_role": target_role.name},
+            critical=True,
+        )
+        await post_audit_to_channel(interaction.client, entry)
+
+        await interaction.response.send_message(f"✅ Assigned {member.mention} to **{target_role.name}**", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ I don’t have permission to edit that user’s roles.", ephemeral=True)
+    except Exception as e:
+        entry = audit_log(
+            "staff_assign_error",
+            interaction.user,
+            {"target_id": member.id, "error": str(e)},
+            critical=True,
+        )
+        await post_audit_to_channel(interaction.client, entry)
+        await interaction.response.send_message("❌ Failed to assign (check bot role hierarchy).", ephemeral=True)
+
+
+@staff_group.command(name="remove", description="Remove a user from all unit + leadership roles (optionally move to Visitor).")
+@app_commands.describe(member="Member to clear", to_visitor="Also add Visitor role")
+async def staff_remove(interaction: discord.Interaction, member: discord.Member, to_visitor: bool = True):
+    if not interaction.guild:
+        await interaction.response.send_message("Server-only command.", ephemeral=True)
+        return
+    if not has_permission(interaction, "staff_manage"):
+        await interaction.response.send_message("⛔ Staff only.", ephemeral=True)
+        return
+
+    roles_cfg = staff_roles_cfg()
+
+    remove_ids = set(flatten_unit_roles(roles_cfg) + leadership_role_ids(roles_cfg))
+    to_remove = []
+    for rid in remove_ids:
+        r = find_role(interaction.guild, rid)
+        if r and r in member.roles:
+            to_remove.append(r)
+
+    try:
+        if to_remove:
+            await member.remove_roles(*to_remove, reason=f"Staff remove by {interaction.user}")
+
+        if to_visitor:
+            visitor_id = status_role_id(roles_cfg, "visitor")
+            visitor_role = find_role(interaction.guild, visitor_id)
+            if visitor_role and visitor_role not in member.roles:
+                await member.add_roles(visitor_role, reason=f"Moved to Visitor by {interaction.user}")
+
+        entry = audit_log(
+            "staff_remove",
+            interaction.user,
+            {"target_id": member.id, "target": str(member), "to_visitor": to_visitor},
+            critical=True,
+        )
+        await post_audit_to_channel(interaction.client, entry)
+
+        await interaction.response.send_message(f"✅ Cleared unit/lead roles for {member.mention}", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ I don’t have permission to edit that user’s roles.", ephemeral=True)
+    except Exception as e:
+        entry = audit_log("staff_remove_error", interaction.user, {"target_id": member.id, "error": str(e)}, critical=True)
+        await post_audit_to_channel(interaction.client, entry)
+        await interaction.response.send_message("❌ Failed to remove roles.", ephemeral=True)
+
+
+@staff_group.command(name="leader_add", description="Add a leadership role to a member (HQ Lead / Platoon Lead / Squad Lead).")
+@app_commands.describe(member="Member to update", leader_role="Leadership role to add")
+@app_commands.autocomplete(leader_role=leader_autocomplete)
+async def staff_leader_add(interaction: discord.Interaction, member: discord.Member, leader_role: str):
+    if not interaction.guild:
+        await interaction.response.send_message("Server-only command.", ephemeral=True)
+        return
+    if not has_permission(interaction, "promote_demote"):
+        await interaction.response.send_message("⛔ Command only.", ephemeral=True)
+        return
+
+    rid = int(leader_role)
+    role = find_role(interaction.guild, rid)
+    if not role:
+        await interaction.response.send_message("⚠️ Leadership role not found/configured.", ephemeral=True)
+        return
+
+    try:
+        await member.add_roles(role, reason=f"Leader add by {interaction.user}")
+
+        entry = audit_log(
+            "leader_add",
+            interaction.user,
+            {"target_id": member.id, "target": str(member), "leader_role_id": rid, "leader_role": role.name},
+            critical=True,
+        )
+        await post_audit_to_channel(interaction.client, entry)
+
+        await interaction.response.send_message(f"✅ Added **{role.name}** to {member.mention}", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ I don’t have permission to edit that user’s roles.", ephemeral=True)
+    except Exception as e:
+        entry = audit_log("leader_add_error", interaction.user, {"target_id": member.id, "error": str(e)}, critical=True)
+        await post_audit_to_channel(interaction.client, entry)
+        await interaction.response.send_message("❌ Failed to add leader role.", ephemeral=True)
+
+
+@staff_group.command(name="leader_remove", description="Remove a leadership role from a member.")
+@app_commands.describe(member="Member to update", leader_role="Leadership role to remove")
+@app_commands.autocomplete(leader_role=leader_autocomplete)
+async def staff_leader_remove(interaction: discord.Interaction, member: discord.Member, leader_role: str):
+    if not interaction.guild:
+        await interaction.response.send_message("Server-only command.", ephemeral=True)
+        return
+    if not has_permission(interaction, "promote_demote"):
+        await interaction.response.send_message("⛔ Command only.", ephemeral=True)
+        return
+
+    rid = int(leader_role)
+    role = find_role(interaction.guild, rid)
+    if not role:
+        await interaction.response.send_message("⚠️ Leadership role not found/configured.", ephemeral=True)
+        return
+
+    try:
+        if role in member.roles:
+            await member.remove_roles(role, reason=f"Leader remove by {interaction.user}")
+
+        entry = audit_log(
+            "leader_remove",
+            interaction.user,
+            {"target_id": member.id, "target": str(member), "leader_role_id": rid, "leader_role": role.name},
+            critical=True,
+        )
+        await post_audit_to_channel(interaction.client, entry)
+
+        await interaction.response.send_message(f"✅ Removed **{role.name}** from {member.mention}", ephemeral=True)
+
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ I don’t have permission to edit that user’s roles.", ephemeral=True)
+    except Exception as e:
+        entry = audit_log("leader_remove_error", interaction.user, {"target_id": member.id, "error": str(e)}, critical=True)
+        await post_audit_to_channel(interaction.client, entry)
+        await interaction.response.send_message("❌ Failed to remove leader role.", ephemeral=True)
+
+
+tree.add_command(staff_group)
 
 
 # ---------- SAM & HQ SWITCH COMMANDS ----------
