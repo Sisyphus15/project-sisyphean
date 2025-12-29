@@ -8,15 +8,22 @@ import urllib.error
 from functools import partial
 from typing import Any
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 import aiohttp
 import json
+import sqlite3
+import re
+from datetime import timezone, timedelta
+from dateutil import parser as dtparser
+from zoneinfo import ZoneInfo
 from audit_logger import audit_log
 from permissions import has_permission
 from audit_discord import post_audit_to_channel
+from task_store import TaskStore, Task
 
+logging.basicConfig(level=logging.INFO)
 
 # ---------- ENV + CONFIG + LOGGING ----------
 
@@ -73,9 +80,33 @@ F1_CONNECT = (RUST_CFG.get("f1_connect") or os.getenv("F1_CONNECT", "")).strip()
 intents = discord.Intents.default()
 intents.guilds = True  # we need this for slash commands
 intents.messages = True
+intents.message_content = True  # required for prefix commands
+intents.voice_states = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree  # nicer alias
+
+
+@bot.event
+async def setup_hook():
+    try:
+        guild_id = int(os.getenv("DISCORD_GUILD_ID", "0") or 0) or int(os.getenv("RUST_GUILD_ID", "0") or 0)
+
+        if not guild_id:
+            logging.warning("⚠️ No DISCORD_GUILD_ID/RUST_GUILD_ID set. Syncing GLOBAL (may take a while to appear).")
+            synced = await bot.tree.sync()
+            logging.info("✅ Synced %d GLOBAL commands", len(synced))
+            return
+
+        guild = discord.Object(id=guild_id)
+        bot.tree.copy_global_to(guild=guild)
+
+        synced = await bot.tree.sync(guild=guild)
+        logging.info("✅ Synced %d GUILD commands to %s", len(synced), guild_id)
+        logging.info("📌 Commands: %s", ", ".join([c.name for c in synced]))
+    except Exception:
+        logging.exception("❌ Command sync failed in setup_hook")
 
 
 # ---------- HELPERS ----------
@@ -163,6 +194,58 @@ def add_f1_to_description(desc: str) -> str:
             f"```{F1_CONNECT}```"
         )
     return desc
+
+
+# ---------- TASK HELPERS ----------
+
+def ts_fmt(unix_ts: int, style: str = "R") -> str:
+    # style: R=relative, F=full, f=short date/time, D=date
+    return f"<t:{unix_ts}:{style}>"
+
+
+def is_task_admin(member: discord.Member) -> bool:
+    if not TASK_ADMIN_ROLE_IDS:
+        # if not configured, allow anyone with Manage Messages as a sensible default
+        return member.guild_permissions.manage_messages
+    member_role_ids = {r.id for r in member.roles}
+    return any(rid in member_role_ids for rid in TASK_ADMIN_ROLE_IDS)
+
+
+def status_emoji(status: str) -> str:
+    return {
+        "PENDING": "⏳",
+        "IN_PROGRESS": "🛠️",
+        "HOLD": "🧊",
+        "DONE": "✅",
+    }.get(status, "📌")
+
+
+def build_task_embed(guild: discord.Guild, task: Task) -> discord.Embed:
+    role = guild.get_role(task.assigned_role_id)
+    assigned = role.mention if role else f"`role:{task.assigned_role_id}`"
+    target = f"<@{task.target_user_id}>" if task.target_user_id else "—"
+    due = ts_fmt(task.due_at, "R") + " • " + ts_fmt(task.due_at, "f") if task.due_at else "—"
+    creator = guild.get_member(task.created_by)
+    creator_name = creator.display_name if creator else "Unknown"
+
+    e = discord.Embed(
+        title=f"{status_emoji(task.status)} Task #{task.id}: {task.title}",
+        description="Project Sisyphean Tasking",
+    )
+    e.add_field(name="Status", value=f"`{task.status}`", inline=True)
+    e.add_field(name="Assigned To", value=assigned, inline=True)
+    e.add_field(name="Target", value=target, inline=True)
+    e.add_field(name="Due", value=due, inline=False)
+
+    e.set_footer(text=f"Created by {creator_name} • Updated {ts_fmt(task.updated_at, 'R')}")
+
+    if task.status == "DONE" and getattr(task, "completed_by", None):
+        completer = guild.get_member(task.completed_by)
+        completer_name = completer.display_name if completer else "Unknown"
+        when = ts_fmt(task.completed_at, "R") if task.completed_at else "—"
+        e.add_field(name="Completed", value=f"{completer_name} • {when}", inline=False)
+
+    return e
 
 
 async def call_rustplus_api(path: str, method: str = "GET", json_body: dict | None = None) -> dict:
@@ -392,6 +475,49 @@ async def ensure_rust_permission(interaction: discord.Interaction) -> bool:
 
     return True
 
+
+class TaskActionView(discord.ui.View):
+    def __init__(self, task_id: int):
+        super().__init__(timeout=None)
+        self.task_id = task_id
+
+    async def _apply(self, interaction: discord.Interaction, new_status: str):
+        if not isinstance(interaction.user, discord.Member) or not is_task_admin(interaction.user):
+            await interaction.response.send_message("❌ You don’t have permission to modify tasks.", ephemeral=True)
+            return
+
+        task = store.get(self.task_id)
+        if not task:
+            await interaction.response.send_message("❌ Task not found.", ephemeral=True)
+            return
+
+        if new_status == "DONE":
+            store.complete_task(self.task_id, interaction.user.id)
+        else:
+            store.update_status_by(self.task_id, new_status, interaction.user.id)
+
+        task = store.get(self.task_id)
+        if interaction.guild and task:
+            await update_task_message(interaction.guild, task)
+
+        await interaction.response.send_message(f"✅ Task #{self.task_id} → `{new_status}`", ephemeral=True)
+
+    @discord.ui.button(label="Complete", style=discord.ButtonStyle.success, emoji="✅")
+    async def complete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply(interaction, "DONE")
+
+    @discord.ui.button(label="In Progress", style=discord.ButtonStyle.primary, emoji="🛠️")
+    async def progress_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply(interaction, "IN_PROGRESS")
+
+    @discord.ui.button(label="Hold", style=discord.ButtonStyle.secondary, emoji="🧊")
+    async def hold_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply(interaction, "HOLD")
+
+    @discord.ui.button(label="Reopen", style=discord.ButtonStyle.danger, emoji="🔄")
+    async def reopen_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply(interaction, "PENDING")
+
 def is_leadership():
     """App command check: allow leadership role or server admins."""
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -409,6 +535,172 @@ def is_leadership():
         return interaction.user.guild_permissions.administrator
 
     return app_commands.check(predicate)
+
+
+# ---------- TASK COMMANDS ----------
+
+async def update_task_message(guild: discord.Guild, task: Task):
+    if not task.message_id:
+        return
+    channel = guild.get_channel(TASK_CHANNEL_ID)
+    if channel is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return
+    try:
+        msg = await channel.fetch_message(task.message_id)
+        await msg.edit(embed=build_task_embed(guild, task), view=TaskActionView(task.id))
+    except Exception:
+        # If message was deleted or permissions changed, we silently ignore for now.
+        pass
+
+
+async def set_status(interaction: discord.Interaction, task_id: int, new_status: str):
+    if not isinstance(interaction.user, discord.Member) or not is_task_admin(interaction.user):
+        await interaction.response.send_message("❌ You don’t have permission to modify tasks.", ephemeral=True)
+        return
+
+    task = store.get(task_id)
+    if not task:
+        await interaction.response.send_message("❌ Task not found.", ephemeral=True)
+        return
+
+    if new_status == "DONE":
+        store.complete_task(task_id, interaction.user.id)
+    else:
+        store.update_status_by(task_id, new_status, interaction.user.id)
+    task = store.get(task_id)  # refresh
+    assert task is not None
+
+    if interaction.guild:
+        await update_task_message(interaction.guild, task)
+
+    await interaction.response.send_message(f"✅ Task #{task_id} set to `{new_status}`", ephemeral=True)
+
+
+@tree.command(name="task_create", description="Create a task and assign it to a role.")
+@app_commands.describe(
+    title="Task title",
+    assigned_role="Role responsible for this task",
+    target_user="Optional: who this task is about",
+    due_in_hours="Optional: due in N hours from now"
+)
+async def task_create(
+    interaction: discord.Interaction,
+    title: str,
+    assigned_role: discord.Role,
+    target_user: discord.User | None = None,
+    due_in_hours: int | None = None
+):
+    if not isinstance(interaction.user, discord.Member) or not is_task_admin(interaction.user):
+        await interaction.response.send_message("❌ You don’t have permission to create tasks.", ephemeral=True)
+        return
+
+    due_at = None
+    if due_in_hours is not None:
+        if due_in_hours < 1 or due_in_hours > 24 * 14:
+            await interaction.response.send_message("❌ due_in_hours must be between 1 and 336 (14 days).", ephemeral=True)
+            return
+        now = int(datetime.now(timezone.utc).timestamp())
+        due_at = now + due_in_hours * 3600
+
+    task = store.create_task(
+        title=title.strip(),
+        assigned_role_id=assigned_role.id,
+        created_by=interaction.user.id,
+        target_user_id=target_user.id if target_user else None,
+        due_at=due_at
+    )
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+        return
+
+    channel = guild.get_channel(TASK_CHANNEL_ID)
+    if channel is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message("❌ TASK_CHANNEL_ID is not a valid text channel.", ephemeral=True)
+        return
+
+    embed = build_task_embed(guild, task)
+    view = TaskActionView(task.id)
+    msg = await channel.send(content=assigned_role.mention, embed=embed, view=view)
+    store.set_message_id(task.id, msg.id)
+    store.add_log(task.id, "CREATED", interaction.user.id, "Created via /task_create")
+
+    await interaction.response.send_message(f"✅ Created Task #{task.id} in {channel.mention}", ephemeral=True)
+
+
+@tree.command(name="task_list", description="List recent tasks (optionally filter).")
+@app_commands.describe(status="Filter by status", assigned_role="Filter by assigned role", limit="How many to show (max 25)")
+async def task_list(
+    interaction: discord.Interaction,
+    status: str | None = None,
+    assigned_role: discord.Role | None = None,
+    limit: int = 10
+):
+    if limit < 1:
+        limit = 1
+    if limit > 25:
+        limit = 25
+
+    status_u = status.upper() if status else None
+    if status_u and status_u not in {"PENDING", "IN_PROGRESS", "HOLD", "DONE"}:
+        await interaction.response.send_message("❌ Status must be one of: PENDING, IN_PROGRESS, HOLD, DONE", ephemeral=True)
+        return
+
+    tasks = store.list_tasks(status=status_u, assigned_role_id=assigned_role.id if assigned_role else None, limit=limit)
+
+    if not tasks:
+        await interaction.response.send_message("No tasks found for that filter.", ephemeral=True)
+        return
+
+    lines = []
+    for t in tasks:
+        role_mention = f"<@&{t.assigned_role_id}>"
+        due = f" • due {ts_fmt(t.due_at,'R')}" if t.due_at else ""
+        lines.append(f"{status_emoji(t.status)} **#{t.id}** `{t.status}` — {t.title} → {role_mention}{due}")
+
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@tree.command(name="task_complete", description="Mark a task as DONE.")
+async def task_complete(interaction: discord.Interaction, task_id: int):
+    await set_status(interaction, task_id, "DONE")
+
+
+@tree.command(name="task_hold", description="Put a task on HOLD.")
+async def task_hold(interaction: discord.Interaction, task_id: int):
+    await set_status(interaction, task_id, "HOLD")
+
+
+@tree.command(name="task_reopen", description="Reopen a task (set to PENDING).")
+async def task_reopen(interaction: discord.Interaction, task_id: int):
+    await set_status(interaction, task_id, "PENDING")
+
+
+@tree.command(name="task_progress", description="Set a task to IN_PROGRESS.")
+async def task_progress(interaction: discord.Interaction, task_id: int):
+    await set_status(interaction, task_id, "IN_PROGRESS")
+
+
+@tree.command(name="task_assign", description="Reassign a task to a different role.")
+async def task_assign(interaction: discord.Interaction, task_id: int, assigned_role: discord.Role):
+    if not isinstance(interaction.user, discord.Member) or not is_task_admin(interaction.user):
+        await interaction.response.send_message("❌ You don’t have permission to modify tasks.", ephemeral=True)
+        return
+
+    task = store.get(task_id)
+    if not task:
+        await interaction.response.send_message("❌ Task not found.", ephemeral=True)
+        return
+
+    store.assign_role_by(task_id, assigned_role.id, interaction.user.id)
+    task = store.get(task_id)
+    assert task is not None
+
+    if interaction.guild:
+        await update_task_message(interaction.guild, task)
+
+    await interaction.response.send_message(f"✅ Task #{task_id} reassigned to {assigned_role.mention}", ephemeral=True)
 
 
 # Load .env
@@ -462,19 +754,8 @@ RUSTPLUS_API_BASE = os.getenv("RUSTPLUS_API_BASE", "").rstrip("/")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 BOT_PREFIX = os.getenv("BOT_PREFIX", "!")
-
-
-# ---------- BOT EVENTS ----------
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-
-    try:
-        synced = await bot.tree.sync()  # sync GLOBAL commands
-        print(f"✅ Synced {len(synced)} global application commands.")
-    except Exception as e:
-        print("Error syncing global commands:", e)
+TASK_CHANNEL_ID = int(os.getenv("TASK_CHANNEL_ID", "0") or 0)
+TASK_ADMIN_ROLE_IDS = [int(x.strip()) for x in os.getenv("TASK_ADMIN_ROLE_IDS", "").split(",") if x.strip().isdigit()]
 
 
 # -------------------------
@@ -484,6 +765,20 @@ async def on_ready():
 CONNECT_CONFIG_PATH = os.getenv("CONNECT_CONFIG_PATH") or os.path.join(BASE_DIR, "connect_servers.json")
 ROLES_CONFIG_PATH = os.getenv("ROLES_CONFIG_PATH") or os.path.join(BASE_DIR, "roles_config.json")
 DUTY_STATUS_STATE_PATH = os.getenv("DUTY_STATUS_STATE_PATH") or os.path.join(BASE_DIR, "duty_status.json")
+DUTY_AUTOMATION_PATH = os.path.join(BASE_DIR, "duty_automation.json")
+TASK_DB_PATH = os.getenv("TASK_DB_PATH")  # TaskStore will fallback to sisyphus.db if unset
+
+# ---------- TASK STORE ----------
+
+store = TaskStore(db_path=TASK_DB_PATH)
+os.makedirs("logs", exist_ok=True)
+task_logger = logging.getLogger("tasks")
+if not task_logger.handlers:
+    handler = logging.FileHandler(os.path.join("logs", "tasks.log"), encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    task_logger.addHandler(handler)
+task_logger.setLevel(logging.INFO)
 
 
 # ---------- ROLE CONFIG ----------
@@ -857,6 +1152,478 @@ def find_role(guild: discord.Guild, role_id: int) -> discord.Role | None:
     return guild.get_role(role_id)
 
 
+# ---------- DUTY AUTOMATION CONFIG ----------
+
+def load_duty_automation_cfg() -> dict:
+    try:
+        with open(DUTY_AUTOMATION_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        logging.warning("duty_automation.json not found; duty automation disabled.")
+        return {"enabled": False}
+    except Exception as e:
+        logging.exception("Failed to read duty_automation.json: %s", e)
+        return {"enabled": False}
+
+
+def save_duty_automation_cfg(cfg: dict) -> bool:
+    try:
+        with open(DUTY_AUTOMATION_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        logging.exception("Failed to write duty_automation.json: %s", e)
+        return False
+
+
+DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+
+
+# ---------- TIME PING (GLOBAL TEAM COORDINATION) ----------
+
+TIME_DB_PATH = os.path.join(BASE_DIR, "sisyphus.db")
+DEFAULT_TZ = "America/New_York"
+
+TZ_ALIASES = {
+    "est": "America/New_York",
+    "edt": "America/New_York",
+    "cst": "America/Chicago",
+    "cdt": "America/Chicago",
+    "mst": "America/Denver",
+    "mdt": "America/Denver",
+    "pst": "America/Los_Angeles",
+    "pdt": "America/Los_Angeles",
+    "pt": "America/Los_Angeles",
+    "et": "America/New_York",
+    "ct": "America/Chicago",
+    "mt": "America/Denver",
+    "uk": "Europe/London",
+    "gmt": "Etc/GMT",
+    "utc": "UTC",
+}
+
+TIME_RANGE_RE = re.compile(r"^\\s*(?P<start>.+?)\\s*-\\s*(?P<end>.+?)(?:\\s+(?P<tz>[A-Za-z/_]+))?\\s*$")
+TIME_INLINE_RE = re.compile(r"(?:^|\\s)!(?:t|time)\\s+(.+)$", re.IGNORECASE)
+
+
+def _time_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(TIME_DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_timezones (
+            user_id INTEGER PRIMARY KEY,
+            tz TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS voice_sessions (
+            user_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            started_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, guild_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS voice_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER NOT NULL,
+            seconds INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_voice_history_lookup ON voice_history (guild_id, user_id, started_at)"
+    )
+    return conn
+
+
+def normalize_tz(tz: str) -> str:
+    t = tz.strip().lower()
+    return TZ_ALIASES.get(t, tz.strip())
+
+
+def set_user_timezone(user_id: int, tz: str) -> None:
+    with _time_db() as conn:
+        conn.execute(
+            "INSERT INTO user_timezones (user_id, tz) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET tz=excluded.tz",
+            (user_id, tz),
+        )
+
+
+def get_user_timezone(user_id: int) -> str:
+    with _time_db() as conn:
+        row = conn.execute("SELECT tz FROM user_timezones WHERE user_id=?", (user_id,)).fetchone()
+    return row[0] if row else DEFAULT_TZ
+
+
+def parse_duration(text: str) -> timedelta | None:
+    s = text.strip().lower()
+    s = s.removeprefix("in ").strip()
+    m = re.fullmatch(r"(?:(\\d+)\\s*h)?\\s*(?:(\\d+)\\s*m)?", s)
+    if not m:
+        return None
+    h = int(m.group(1) or 0)
+    mins = int(m.group(2) or 0)
+    if h == 0 and mins == 0:
+        return None
+    return timedelta(hours=h, minutes=mins)
+
+
+def stamp(dt_utc: datetime, style: str = "t") -> str:
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    dt_utc = dt_utc.astimezone(timezone.utc)
+
+    ts = int(dt_utc.timestamp())
+
+    # Clamp clearly-bad timestamps (before 2000) to now to avoid ancient dates.
+    if ts < 946684800:
+        ts = int(datetime.now(timezone.utc).timestamp())
+
+    return f"<t:{ts}:{style}>"
+
+
+def parse_when_to_utc(when: str, user_tz: str) -> tuple[datetime, datetime | None]:
+    raw = when.strip()
+
+    dur = parse_duration(raw)
+    if dur:
+        start = datetime.now(timezone.utc) + dur
+        return start, None
+
+    m = TIME_RANGE_RE.match(raw)
+    if m:
+        start_txt = m.group("start").strip()
+        end_txt = m.group("end").strip()
+        tz_txt = m.group("tz")
+        src_tz = normalize_tz(tz_txt) if tz_txt else user_tz
+
+        z = ZoneInfo(src_tz)
+        now_local = datetime.now(z).replace(second=0, microsecond=0)
+
+        start_local = dtparser.parse(start_txt, default=now_local)
+        end_local = dtparser.parse(end_txt, default=now_local)
+
+        if end_local <= start_local:
+            end_local += timedelta(days=1)
+
+        return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+    # single time with optional tz suffix ("8pm uk")
+    parts = raw.split()
+    src_tz = user_tz
+    if len(parts) >= 2 and ("/" in parts[-1] or parts[-1].lower() in TZ_ALIASES):
+        src_tz = normalize_tz(parts[-1])
+        raw = " ".join(parts[:-1]).strip()
+
+    z = ZoneInfo(src_tz)
+    now_local = datetime.now(z).replace(second=0, microsecond=0)
+    dt_local = dtparser.parse(raw, default=now_local)
+
+    # If time-only and already passed today, assume tomorrow
+    if dt_local <= now_local and re.search(r"\\d", raw) and not re.search(r"\\b(yesterday|today|tomorrow|next)\\b", raw.lower()):
+        dt_local += timedelta(days=1)
+
+    return dt_local.astimezone(timezone.utc), None
+
+
+# ---------- DUTY AUTOMATION / VOICE TRACKING ----------
+
+
+def is_excluded_voice_channel(channel: discord.abc.GuildChannel | None) -> bool:
+    if not channel:
+        return True  # treat None as excluded for safety
+
+    cfg = DUTY_AUTOMATION_CFG or {}
+    name_excludes = {str(x).strip().lower() for x in cfg.get("exclude_voice_channel_names", []) if x}
+    id_excludes = {int(x) for x in cfg.get("exclude_voice_channel_ids", []) if str(x).isdigit()}
+
+    if channel.id in id_excludes:
+        return True
+
+    if channel.name and channel.name.strip().lower() in name_excludes:
+        return True
+
+    return False
+
+
+def _loa_set(guild_id: int, user_id: int, start_ts: int, end_ts: int, reason: str | None, created_by: int | None) -> None:
+    with _time_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO loa (guild_id, user_id, start_ts, end_ts, reason, created_by, created_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, user_id)
+            DO UPDATE SET start_ts=excluded.start_ts, end_ts=excluded.end_ts, reason=excluded.reason,
+                          created_by=excluded.created_by, created_ts=excluded.created_ts
+            """,
+            (guild_id, user_id, start_ts, end_ts, reason, created_by, int(datetime.now(timezone.utc).timestamp())),
+        )
+
+
+def _loa_clear(guild_id: int, user_id: int) -> bool:
+    with _time_db() as conn:
+        cur = conn.execute("DELETE FROM loa WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        return cur.rowcount > 0
+
+
+def _loa_get_active(guild_id: int, user_id: int, now_ts: int) -> tuple[int, int, str | None] | None:
+    with _time_db() as conn:
+        row = conn.execute(
+            "SELECT start_ts, end_ts, reason FROM loa WHERE guild_id=? AND user_id=? AND end_ts>?",
+            (guild_id, user_id, now_ts),
+        ).fetchone()
+    if not row:
+        return None
+    return int(row[0]), int(row[1]), (row[2] if row[2] else None)
+
+
+def _is_on_loa(guild_id: int, user_id: int, now_ts: int) -> bool:
+    return _loa_get_active(guild_id, user_id, now_ts) is not None
+
+
+def _start_session(guild_id: int, user_id: int, channel_id: int, start_ts: int) -> None:
+    with _time_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO voice_sessions (user_id, guild_id, channel_id, started_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, guild_id) DO UPDATE SET channel_id=excluded.channel_id, started_at=excluded.started_at
+            """,
+            (user_id, guild_id, channel_id, start_ts),
+        )
+
+
+def _end_session_and_add(guild_id: int, user_id: int, end_ts: int) -> None:
+    with _time_db() as conn:
+        row = conn.execute(
+            "SELECT channel_id, started_at FROM voice_sessions WHERE user_id=? AND guild_id=?",
+            (user_id, guild_id),
+        ).fetchone()
+        if not row:
+            return
+
+        channel_id, started_at = row
+        seconds = max(0, end_ts - int(started_at))
+
+        cfg = DUTY_AUTOMATION_CFG or {}
+        min_sec = int(cfg.get("min_session_seconds", 0) or 0)
+
+        conn.execute("DELETE FROM voice_sessions WHERE user_id=? AND guild_id=?", (user_id, guild_id))
+
+        if seconds < min_sec:
+            return
+
+        conn.execute(
+            """
+            INSERT INTO voice_history (user_id, guild_id, channel_id, started_at, ended_at, seconds)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, guild_id, channel_id, started_at, end_ts, seconds),
+        )
+
+
+def _period_start_ts(period_start: str) -> int:
+    try:
+        dt = datetime.fromisoformat(period_start)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
+
+def _get_week_seconds(guild_id: int, user_id: int, period_start: str) -> int:
+    start_ts = _period_start_ts(period_start)
+    with _time_db() as conn:
+        row = conn.execute(
+            "SELECT SUM(seconds) FROM voice_history WHERE guild_id=? AND user_id=? AND started_at>=?",
+            (guild_id, user_id, start_ts),
+        ).fetchone()
+    return int(row[0] or 0)
+
+
+def period_start_utc(dt: datetime, period: str) -> str:
+    d = dt.astimezone(timezone.utc).date()
+    period = (period or "weekly").lower()
+
+    if period == "weekly":
+        start = d - timedelta(days=d.weekday())  # Monday
+        return start.isoformat()
+
+    if period == "biweekly":
+        epoch = datetime(2020, 1, 6, tzinfo=timezone.utc).date()  # Monday
+        delta_days = (d - epoch).days
+        block = (delta_days // 14) * 14
+        return (epoch + timedelta(days=block)).isoformat()
+
+    if period == "monthly":
+        return d.replace(day=1).isoformat()
+
+    start = d - timedelta(days=d.weekday())
+    return start.isoformat()
+
+
+def classify_duty_from_hours(hours: float, thresholds: dict) -> str:
+    items = []
+    for k, v in (thresholds or {}).items():
+        try:
+            items.append((k, float(v)))
+        except Exception:
+            continue
+    items.sort(key=lambda t: t[1], reverse=True)
+
+    for key, th in items:
+        if hours >= th:
+            return key
+    return "inactive_reservist"
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    logging.info(
+        "VOICE evt | %s | before=%s | after=%s",
+        member.display_name,
+        getattr(before.channel, "name", None),
+        getattr(after.channel, "name", None),
+    )
+    if member.bot or not member.guild:
+        return
+
+    if after.channel and after.channel.name != "Lost In The Woods":
+        ch = member.guild.system_channel
+        if ch:
+            await ch.send(f"🎙 {member.display_name} joined {after.channel.name}", delete_after=10)
+
+    guild_id = member.guild.id
+    user_id = member.id
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    if _is_on_loa(guild_id, user_id, now_ts):
+        _end_session_and_add(guild_id, user_id, now_ts)
+        return
+
+    before_ch = before.channel
+    after_ch = after.channel
+
+    before_ok = (before_ch is not None) and (not is_excluded_voice_channel(before_ch))
+    after_ok = (after_ch is not None) and (not is_excluded_voice_channel(after_ch))
+    logging.info("VOICE ok? before_ok=%s after_ok=%s", before_ok, after_ok)
+
+    if before_ch is None and after_ok:
+        logging.info("VOICE START: %s -> %s", member.display_name, after_ch.name)
+        _start_session(guild_id, user_id, after_ch.id, now_ts)
+        return
+
+    if before_ok and after_ch is None:
+        logging.info("VOICE END: %s left %s", member.display_name, before_ch.name)
+        _end_session_and_add(guild_id, user_id, now_ts)
+        return
+
+    if before_ok and after_ok and before_ch.id != after_ch.id:
+        _end_session_and_add(guild_id, user_id, now_ts)
+        _start_session(guild_id, user_id, after_ch.id, now_ts)
+        return
+
+    if before_ok and (after_ch is not None) and (not after_ok):
+        _end_session_and_add(guild_id, user_id, now_ts)
+        return
+
+    if (before_ch is not None) and (not before_ok) and after_ok:
+        _start_session(guild_id, user_id, after_ch.id, now_ts)
+        return
+
+    # excluded -> excluded or no meaningful change: ignore
+
+
+@tasks.loop(minutes=30)
+async def duty_enforce_periodic():
+    await bot.wait_until_ready()
+
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    cfg = DUTY_AUTOMATION_CFG or {}
+
+    if not cfg.get("enabled", False):
+        return
+
+    period = str(cfg.get("period", "weekly")).lower()
+    run_hour = int(cfg.get("run_hour_utc", 12) or 12)
+
+    now = datetime.now(timezone.utc)
+
+    if now.hour != run_hour:
+        return
+
+    if period == "monthly":
+        first_this = now.date().replace(day=1)
+        prev_end = datetime.combine(first_this, datetime.min.time(), tzinfo=timezone.utc) - timedelta(seconds=1)
+        prev_start = period_start_utc(prev_end, "monthly")
+    else:
+        prev_start = period_start_utc(now - timedelta(days=7 if period == "weekly" else 14), period)
+
+    thresholds = cfg.get("thresholds_hours", {}) or {}
+    grace_days = int(cfg.get("new_member_grace_days", 0) or 0)
+
+    for guild in bot.guilds:
+        for member in guild.members:
+            if member.bot:
+                continue
+            now_ts = int(now.timestamp())
+            if _is_on_loa(guild.id, member.id, now_ts):
+                continue
+            if grace_days and member.joined_at:
+                joined = member.joined_at
+                if joined.tzinfo is None:
+                    joined = joined.replace(tzinfo=timezone.utc)
+                if (now - joined).days < grace_days:
+                    continue
+
+            sec = _get_week_seconds(guild.id, member.id, prev_start)
+            hours = sec / 3600.0
+            target = classify_duty_from_hours(hours, thresholds)
+
+            status_roles = get_duty_status_role_ids()
+            current = None
+            for k, rid in status_roles.items():
+                if rid and any(r.id == rid for r in member.roles):
+                    current = k
+                    break
+            if current == target:
+                continue
+
+            try:
+                pretty = await apply_duty_status(
+                    guild,
+                    member,
+                    target,
+                    actor=None,
+                    source=f"voice_{period}({hours:.2f}h)",
+                )
+                entry = audit_log(
+                    "duty_auto_enforce",
+                    bot.user,
+                    {"user_id": member.id, "hours": round(hours, 2), "period_start": prev_start, "target": target, "pretty": pretty},
+                    critical=False,
+                )
+                await post_audit_to_channel(bot, entry)
+            except Exception as e:
+                logging.exception("Auto duty enforce failed for %s: %s", member.id, e)
+
+
 # ---------- SLASH COMMANDS ----------
 
 @tree.command(description="Check if the bot is online.")
@@ -865,6 +1632,100 @@ async def ping(interaction: discord.Interaction):
         f"Pong! 🏓 Latency: {round(bot.latency * 1000)} ms",
         ephemeral=True,
     )
+
+
+@tree.command(description="Set your timezone for /time (e.g., America/New_York, Europe/London, pst, uk).")
+@app_commands.describe(timezone_str="IANA timezone (America/New_York) or shortcut (pst/uk/gmt)")
+async def tz_set(interaction: discord.Interaction, timezone_str: str):
+    tz = normalize_tz(timezone_str)
+    try:
+        ZoneInfo(tz)
+    except Exception:
+        await interaction.response.send_message(
+            f"❌ Unknown timezone: `{timezone_str}`. Try `America/New_York` or `Europe/London`.",
+            ephemeral=True,
+        )
+        return
+
+    set_user_timezone(interaction.user.id, tz)
+    await interaction.response.send_message(f"✅ Timezone set to `{tz}`", ephemeral=True)
+
+
+@tree.command(description="Show your saved timezone for /time.")
+async def tz_me(interaction: discord.Interaction):
+    tz = get_user_timezone(interaction.user.id)
+    now_local = datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d %I:%M %p")
+    await interaction.response.send_message(
+        f"🧭 Your timezone: `{tz}` • Local time: **{now_local}**",
+        ephemeral=True,
+    )
+
+
+@tree.command(description="Post a time ping in everyone's local time.")
+@app_commands.describe(when="Examples: 8pm | tomorrow 7pm | 10-12 gmt | 20:00 uk | in 90m")
+async def time(interaction: discord.Interaction, when: str):
+    user_tz = get_user_timezone(interaction.user.id)
+
+    try:
+        start_utc, end_utc = parse_when_to_utc(when, user_tz)
+    except Exception:
+        await interaction.response.send_message(
+            "❌ Couldn't parse that. Try: `8pm`, `tomorrow 7pm`, `10-12 gmt`, `20:00 uk`, `in 90m`",
+            ephemeral=True,
+        )
+        return
+
+    if end_utc:
+        msg = f"🕒 **Window:** {stamp(start_utc,'t')}–{stamp(end_utc,'t')} ({stamp(start_utc,'R')})"
+    else:
+        msg = f"🕒 **Time:** {stamp(start_utc,'t')} ({stamp(start_utc,'R')})"
+
+    await interaction.response.send_message(msg)
+
+
+@bot.command(name="t", aliases=["time"])
+async def time_prefix(ctx: commands.Context, *, when: str):
+    """
+    Casual time ping: !t 5:00PM
+    Also supports your parser: !t 10-12 gmt | !t tomorrow 7pm | !t in 90m
+    """
+    try:
+        user_tz = get_user_timezone(ctx.author.id)
+        start_utc, end_utc = parse_when_to_utc(when, user_tz)
+    except Exception:
+        await ctx.send("❌ Couldn't parse that. Try: `!t 5pm`, `!t tomorrow 7pm`, `!t 10-12 gmt`, `!t in 90m`")
+        return
+
+    if end_utc:
+        msg = f"🕒 **Window:** {stamp(start_utc,'t')}–{stamp(end_utc,'t')} ({stamp(start_utc,'R')})"
+    else:
+        msg = f"🕒 **Time:** {stamp(start_utc,'t')} ({stamp(start_utc,'R')})"
+
+    await ctx.send(msg)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    # allow inline trigger like: "meet me at !t 5pm"
+    m = TIME_INLINE_RE.search(message.content)
+    if m:
+        when = m.group(1).strip()
+        try:
+            user_tz = get_user_timezone(message.author.id)
+            start_utc, end_utc = parse_when_to_utc(when, user_tz)
+            if end_utc:
+                msg = f"🕒 **Window:** {stamp(start_utc,'t')}–{stamp(end_utc,'t')} ({stamp(start_utc,'R')})"
+            else:
+                msg = f"🕒 **Time:** {stamp(start_utc,'t')} ({stamp(start_utc,'R')})"
+            await message.channel.send(msg)
+        except Exception:
+            await message.channel.send("❌ Couldn't parse that. Try: `!t 5pm`, `!t 10-12 gmt`, `!t in 90m`")
+
+    # keep normal prefix commands working too
+    await bot.process_commands(message)
 
 
 @tree.command(description="Send a test raid alert to the raid channel.")
@@ -1024,6 +1885,342 @@ async def roles_reload(interaction: discord.Interaction):
         f"✅ Reloaded **{len(ROLE_CONFIG)}** role mappings from `roles_config.json`.",
         ephemeral=True,
     )
+
+
+@tree.command(description="Run duty enforcement NOW (leadership only).")
+async def duty_run_now(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Server-only.", ephemeral=True)
+        return
+
+    allowed_role_ids = [get_role_id("leadership")]
+    if not user_has_any_role(interaction.user, allowed_role_ids):
+        await interaction.response.send_message("⛔ Leadership only.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("✅ Running duty enforcement now...", ephemeral=True)
+
+    # Temporarily bypass the run_hour gate by calling the core logic inline:
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    cfg = DUTY_AUTOMATION_CFG or {}
+
+    if not cfg.get("enabled", False):
+        await interaction.followup.send("⚠️ duty_automation.json has enabled=false", ephemeral=True)
+        return
+
+    period = str(cfg.get("period", "weekly")).lower()
+    now = datetime.now(timezone.utc)
+
+    if period == "monthly":
+        first_this = now.date().replace(day=1)
+        prev_end = datetime.combine(first_this, datetime.min.time(), tzinfo=timezone.utc) - timedelta(seconds=1)
+        prev_start = period_start_utc(prev_end, "monthly")
+    else:
+        prev_start = period_start_utc(now - timedelta(days=7 if period == "weekly" else 14), period)
+
+    thresholds = cfg.get("thresholds_hours", {}) or {}
+    changed = 0
+    grace_days = int(cfg.get("new_member_grace_days", 0) or 0)
+
+    for member in interaction.guild.members:
+        if member.bot:
+            continue
+        if grace_days and member.joined_at:
+            joined = member.joined_at
+            if joined.tzinfo is None:
+                joined = joined.replace(tzinfo=timezone.utc)
+            if (now - joined).days < grace_days:
+                continue
+
+        sec = _get_week_seconds(interaction.guild.id, member.id, prev_start)
+        hours = sec / 3600.0
+        target = classify_duty_from_hours(hours, thresholds)
+
+        status_roles = get_duty_status_role_ids()
+        current = None
+        for k, rid in status_roles.items():
+            if rid and any(r.id == rid for r in member.roles):
+                current = k
+                break
+
+        if current == target:
+            continue
+
+        try:
+            await apply_duty_status(
+                interaction.guild,
+                member,
+                target,
+                actor=interaction.user,
+                source=f"voice_{period}({hours:.2f}h)_manual",
+            )
+            changed += 1
+        except Exception:
+            logging.exception("Failed duty update for %s", member.id)
+
+    await interaction.followup.send(f"✅ Enforcement complete. Changed **{changed}** member(s).", ephemeral=True)
+
+
+@tree.command(description="Show VC hours this period (debug).")
+async def duty_debug_me(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Server-only.", ephemeral=True)
+        return
+
+    cfg = load_duty_automation_cfg() or {}
+    period = str(cfg.get("period", "weekly")).lower()
+    now = datetime.now(timezone.utc)
+
+    if period == "monthly":
+        first_this = now.date().replace(day=1)
+        prev_end = datetime.combine(first_this, datetime.min.time(), tzinfo=timezone.utc) - timedelta(seconds=1)
+        start = period_start_utc(prev_end, "monthly")
+    else:
+        start = period_start_utc(now - timedelta(days=7 if period == "weekly" else 14), period)
+
+    sec = _get_week_seconds(interaction.guild.id, interaction.user.id, start)
+    hours = sec / 3600.0
+    target = classify_duty_from_hours(hours, (cfg.get("thresholds_hours") or {}))
+
+    await interaction.response.send_message(
+        f"🧾 **Duty Debug**\n"
+        f"Period: `{period}`\n"
+        f"Start: `{start}`\n"
+        f"Seconds: `{sec}` (~{hours:.2f}h)\n"
+        f"Would classify as: **{pretty_status_label(target)}**",
+        ephemeral=True,
+    )
+
+
+duty_config_group = app_commands.Group(name="duty_config", description="Configure duty automation (leadership only).")
+
+
+def _require_leadership(interaction: discord.Interaction) -> bool:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return False
+    return user_has_any_role(interaction.user, [get_role_id("leadership")]) or interaction.user.guild_permissions.administrator
+
+
+async def _deny(interaction: discord.Interaction):
+    await interaction.response.send_message("⛔ Leadership only.", ephemeral=True)
+
+
+@duty_config_group.command(name="show", description="Show current duty automation config.")
+async def duty_config_show(interaction: discord.Interaction):
+    if not _require_leadership(interaction):
+        return await _deny(interaction)
+
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    pretty = json.dumps(DUTY_AUTOMATION_CFG, indent=2, ensure_ascii=False)
+    await interaction.response.send_message(f"```json\n{pretty}\n```", ephemeral=True)
+
+
+@duty_config_group.command(name="enable", description="Enable/disable duty automation.")
+@app_commands.describe(enabled="true/false")
+async def duty_config_enable(interaction: discord.Interaction, enabled: bool):
+    if not _require_leadership(interaction):
+        return await _deny(interaction)
+
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    DUTY_AUTOMATION_CFG["enabled"] = bool(enabled)
+    save_duty_automation_cfg(DUTY_AUTOMATION_CFG)
+    await interaction.response.send_message(f"✅ duty automation enabled = `{enabled}`", ephemeral=True)
+
+
+@duty_config_group.command(name="period", description="Set enforcement period.")
+@app_commands.choices(period=[
+    app_commands.Choice(name="weekly", value="weekly"),
+    app_commands.Choice(name="biweekly", value="biweekly"),
+    app_commands.Choice(name="monthly", value="monthly"),
+])
+async def duty_config_period(interaction: discord.Interaction, period: app_commands.Choice[str]):
+    if not _require_leadership(interaction):
+        return await _deny(interaction)
+
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    DUTY_AUTOMATION_CFG["period"] = period.value
+    save_duty_automation_cfg(DUTY_AUTOMATION_CFG)
+    await interaction.response.send_message(f"✅ period = `{period.value}`", ephemeral=True)
+
+
+@duty_config_group.command(name="run_hour_utc", description="Set the UTC hour enforcement runs (0-23).")
+async def duty_config_run_hour(interaction: discord.Interaction, hour: app_commands.Range[int, 0, 23]):
+    if not _require_leadership(interaction):
+        return await _deny(interaction)
+
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    DUTY_AUTOMATION_CFG["run_hour_utc"] = int(hour)
+    save_duty_automation_cfg(DUTY_AUTOMATION_CFG)
+    await interaction.response.send_message(f"✅ run_hour_utc = `{hour}`", ephemeral=True)
+
+
+@duty_config_group.command(name="min_session_seconds", description="Minimum VC session length to count (seconds).")
+async def duty_config_min_session(interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 86400]):
+    if not _require_leadership(interaction):
+        return await _deny(interaction)
+
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    DUTY_AUTOMATION_CFG["min_session_seconds"] = int(seconds)
+    save_duty_automation_cfg(DUTY_AUTOMATION_CFG)
+    await interaction.response.send_message(f"✅ min_session_seconds = `{seconds}`", ephemeral=True)
+
+
+@duty_config_group.command(name="threshold_set", description="Set hours threshold for a duty status.")
+@app_commands.choices(status=[
+    app_commands.Choice(name="active_duty", value="active_duty"),
+    app_commands.Choice(name="reservist", value="reservist"),
+    app_commands.Choice(name="inactive_reservist", value="inactive_reservist"),
+])
+async def duty_config_threshold_set(interaction: discord.Interaction, status: app_commands.Choice[str], hours: float):
+    if not _require_leadership(interaction):
+        return await _deny(interaction)
+
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    DUTY_AUTOMATION_CFG.setdefault("thresholds_hours", {})
+    DUTY_AUTOMATION_CFG["thresholds_hours"][status.value] = float(hours)
+    save_duty_automation_cfg(DUTY_AUTOMATION_CFG)
+    await interaction.response.send_message(f"✅ threshold `{status.value}` = `{hours}` hours", ephemeral=True)
+
+
+@duty_config_group.command(name="exclude_name_add", description="Exclude a voice channel by name (case-insensitive exact match).")
+async def duty_config_exclude_name_add(interaction: discord.Interaction, name: str):
+    if not _require_leadership(interaction):
+        return await _deny(interaction)
+
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    DUTY_AUTOMATION_CFG.setdefault("exclude_voice_channel_names", [])
+    names = {str(x).strip() for x in DUTY_AUTOMATION_CFG["exclude_voice_channel_names"] if x}
+    names.add(name.strip())
+    DUTY_AUTOMATION_CFG["exclude_voice_channel_names"] = sorted(names)
+    save_duty_automation_cfg(DUTY_AUTOMATION_CFG)
+    await interaction.response.send_message(f"✅ excluded channel name added: `{name.strip()}`", ephemeral=True)
+
+
+@duty_config_group.command(name="exclude_name_remove", description="Remove excluded voice channel name.")
+async def duty_config_exclude_name_remove(interaction: discord.Interaction, name: str):
+    if not _require_leadership(interaction):
+        return await _deny(interaction)
+
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    cur = [str(x).strip() for x in DUTY_AUTOMATION_CFG.get("exclude_voice_channel_names", []) if x]
+    new = [x for x in cur if x.lower() != name.strip().lower()]
+    DUTY_AUTOMATION_CFG["exclude_voice_channel_names"] = new
+    save_duty_automation_cfg(DUTY_AUTOMATION_CFG)
+    await interaction.response.send_message(f"✅ excluded channel name removed: `{name.strip()}`", ephemeral=True)
+
+
+@duty_config_group.command(name="exclude_id_add", description="Exclude a voice channel by ID.")
+async def duty_config_exclude_id_add(interaction: discord.Interaction, channel_id: str):
+    if not _require_leadership(interaction):
+        return await _deny(interaction)
+
+    if not channel_id.isdigit():
+        return await interaction.response.send_message("❌ channel_id must be numeric.", ephemeral=True)
+
+    cid = int(channel_id)
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    DUTY_AUTOMATION_CFG.setdefault("exclude_voice_channel_ids", [])
+    ids = {int(x) for x in DUTY_AUTOMATION_CFG["exclude_voice_channel_ids"] if str(x).isdigit()}
+    ids.add(cid)
+    DUTY_AUTOMATION_CFG["exclude_voice_channel_ids"] = sorted(ids)
+    save_duty_automation_cfg(DUTY_AUTOMATION_CFG)
+    await interaction.response.send_message(f"✅ excluded channel id added: `{cid}`", ephemeral=True)
+
+
+@duty_config_group.command(name="exclude_id_remove", description="Remove excluded voice channel ID.")
+async def duty_config_exclude_id_remove(interaction: discord.Interaction, channel_id: str):
+    if not _require_leadership(interaction):
+        return await _deny(interaction)
+
+    if not channel_id.isdigit():
+        return await interaction.response.send_message("❌ channel_id must be numeric.", ephemeral=True)
+
+    cid = int(channel_id)
+    global DUTY_AUTOMATION_CFG
+    DUTY_AUTOMATION_CFG = load_duty_automation_cfg()
+    ids = [int(x) for x in DUTY_AUTOMATION_CFG.get("exclude_voice_channel_ids", []) if str(x).isdigit()]
+    DUTY_AUTOMATION_CFG["exclude_voice_channel_ids"] = [x for x in ids if x != cid]
+    save_duty_automation_cfg(DUTY_AUTOMATION_CFG)
+    await interaction.response.send_message(f"✅ excluded channel id removed: `{cid}`", ephemeral=True)
+
+
+tree.add_command(duty_config_group)
+
+
+@tree.command(description="Put a member on Leave of Absence for X days (skips duty automation).")
+@app_commands.describe(member="Member to place on LOA", days="How many days", reason="Optional reason")
+async def loa_set(interaction: discord.Interaction, member: discord.Member, days: int, reason: str | None = None):
+    if not interaction.guild:
+        await interaction.response.send_message("Server-only command.", ephemeral=True)
+        return
+    if not isinstance(interaction.user, discord.Member) or not has_permission(interaction, "staff_manage"):
+        await interaction.response.send_message("⛔ Staff only.", ephemeral=True)
+        return
+    if days <= 0 or days > 365:
+        await interaction.response.send_message("❌ days must be between 1 and 365.", ephemeral=True)
+        return
+
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    end_ts = now_ts + int(days * 86400)
+
+    _loa_set(interaction.guild.id, member.id, now_ts, end_ts, reason, interaction.user.id)
+
+    # optional: end any running voice session so they don't get partial history weirdness
+    _end_session_and_add(interaction.guild.id, member.id, now_ts)
+
+    until_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    msg = f"✅ {member.mention} is on **LOA** until {stamp(until_dt, 'f')} ({stamp(until_dt, 'R')})."
+    if reason:
+        msg += f"\n**Reason:** {reason}"
+
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@tree.command(description="End a member's Leave of Absence early.")
+@app_commands.describe(member="Member to remove from LOA")
+async def loa_end(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.guild:
+        await interaction.response.send_message("Server-only command.", ephemeral=True)
+        return
+    if not isinstance(interaction.user, discord.Member) or not has_permission(interaction, "staff_manage"):
+        await interaction.response.send_message("⛔ Staff only.", ephemeral=True)
+        return
+
+    removed = _loa_clear(interaction.guild.id, member.id)
+    if removed:
+        await interaction.response.send_message(f"✅ LOA cleared for {member.mention}.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"ℹ️ {member.mention} is not currently on LOA.", ephemeral=True)
+
+
+@tree.command(description="Check your current Leave of Absence status.")
+async def loa_me(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Server-only command.", ephemeral=True)
+        return
+
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    row = _loa_get_active(interaction.guild.id, interaction.user.id, now_ts)
+    if not row:
+        await interaction.response.send_message("✅ You are **not** on LOA.", ephemeral=True)
+        return
+
+    _, end_ts, reason = row
+    until_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    msg = f"🟦 You are on **LOA** until {stamp(until_dt, 'f')} ({stamp(until_dt, 'R')})."
+    if reason:
+        msg += f"\n**Reason:** {reason}"
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @bot.tree.command(description="Add a new server profile to the /connect menu.")
@@ -2419,6 +3616,18 @@ class HQView(discord.ui.View):
             f"✅ Your duty status is now **{pretty}**.",
             ephemeral=True,
         )
+
+
+@bot.event
+async def on_ready():
+    for g in bot.guilds:
+        try:
+            await g.chunk()
+        except Exception:
+            logging.exception("Failed to chunk guild %s", g.id)
+
+    if not duty_enforce_periodic.is_running():
+        duty_enforce_periodic.start()
 
 
 # ---------- ENTRY POINT ----------

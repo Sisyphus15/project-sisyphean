@@ -11,6 +11,7 @@ node_modules/
 # Secrets / local configs
 .env
 *.env
+duty_automation.json
 rust_config.
 rust_config.json
 rustplus.config.json

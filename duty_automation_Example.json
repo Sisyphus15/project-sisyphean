@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "period": "weekly",
+  "run_hour_utc": 12,
+  "min_session_seconds": 120,
+  "exclude_voice_channel_names": ["Lost In The Woods"],
+  "exclude_voice_channel_ids": [],
+  "thresholds_hours": {
+    "active_duty": 6,
+    "reservist": 2,
+    "inactive_reservist": 0
+  }
+}
