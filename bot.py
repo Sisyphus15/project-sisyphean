@@ -21,6 +21,8 @@ from zoneinfo import ZoneInfo
 from audit_logger import audit_log
 from permissions import has_permission
 from audit_discord import post_audit_to_channel
+from logging.handlers import RotatingFileHandler
+import traceback
 from task_store import TaskStore, Task
 
 logging.basicConfig(level=logging.INFO)
@@ -107,6 +109,26 @@ async def setup_hook():
         logging.info("📌 Commands: %s", ", ".join([c.name for c in synced]))
     except Exception:
         logging.exception("❌ Command sync failed in setup_hook")
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    task_logger.exception(
+        "Slash command failed: %s | user=%s guild=%s channel=%s",
+        repr(error),
+        getattr(interaction.user, "id", None),
+        getattr(interaction.guild, "id", None),
+        getattr(interaction.channel, "id", None),
+    )
+    try:
+        msg = "❌ Command failed. Logged."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        # swallow; already logged
+        pass
 
 
 # ---------- HELPERS ----------
@@ -768,17 +790,36 @@ DUTY_STATUS_STATE_PATH = os.getenv("DUTY_STATUS_STATE_PATH") or os.path.join(BAS
 DUTY_AUTOMATION_PATH = os.path.join(BASE_DIR, "duty_automation.json")
 TASK_DB_PATH = os.getenv("TASK_DB_PATH")  # TaskStore will fallback to sisyphus.db if unset
 
-# ---------- TASK STORE ----------
+# ---------- TASK STORE / LOGGING ----------
 
+def setup_tasks_logger() -> logging.Logger:
+    os.makedirs("logs", exist_ok=True)
+
+    logger = logging.getLogger("tasks")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # prevents duplicate logs via root logger
+
+    # avoid duplicate handlers if code reloads
+    if any(
+        isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "").endswith("tasks.log")
+        for h in logger.handlers
+    ):
+        return logger
+
+    fh = RotatingFileHandler("logs/tasks.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(fh)
+
+    # mirror to stdout so journald captures task logs/errors
+    sh = logging.StreamHandler()
+    sh.setFormatter(logging.Formatter("TASKS %(levelname)s %(message)s"))
+    logger.addHandler(sh)
+
+    return logger
+
+task_logger = setup_tasks_logger()
+task_logger.info("Tasks logger online. PID=%s", os.getpid())
 store = TaskStore(db_path=TASK_DB_PATH)
-os.makedirs("logs", exist_ok=True)
-task_logger = logging.getLogger("tasks")
-if not task_logger.handlers:
-    handler = logging.FileHandler(os.path.join("logs", "tasks.log"), encoding="utf-8")
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    handler.setFormatter(formatter)
-    task_logger.addHandler(handler)
-task_logger.setLevel(logging.INFO)
 
 
 # ---------- ROLE CONFIG ----------
