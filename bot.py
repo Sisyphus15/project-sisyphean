@@ -359,6 +359,50 @@ async def handle_entity_status(interaction: discord.Interaction, entity_name: st
     )
 
 
+async def post_task_log(guild: discord.Guild, embed: discord.Embed) -> None:
+    if not TASK_LOG_CHANNEL_ID:
+        task_logger.warning("TASK_LOG_CHANNEL_ID not set; skipping task log post")
+        return
+    ch = guild.get_channel(TASK_LOG_CHANNEL_ID)
+    if ch is None:
+        task_logger.error("Task log channel not found in cache: %s", TASK_LOG_CHANNEL_ID)
+        return
+    if not isinstance(ch, discord.TextChannel):
+        task_logger.error("Task log channel is not a TextChannel: %s (%s)", getattr(ch, "name", "?"), ch.id)
+        return
+    task_logger.info("Posting task log to #%s (%s)", getattr(ch, "name", "?"), ch.id)
+    try:
+        await ch.send(embed=embed)
+    except Exception:
+        task_logger.exception("Failed to post task log to channel_id=%s", TASK_LOG_CHANNEL_ID)
+
+
+def build_task_log_embed(
+    guild: discord.Guild,
+    task: Task,
+    action: str,
+    actor: discord.Member | discord.User,
+) -> discord.Embed:
+    role = guild.get_role(task.assigned_role_id)
+    assigned = role.mention if role else f"`role:{task.assigned_role_id}`"
+    target = f"<@{task.target_user_id}>" if task.target_user_id else "—"
+    embed = discord.Embed(
+        title=f"Task {action}",
+        description=f"**#{task.id}** — {task.title}",
+        color=discord.Color.blurple(),
+        timestamp=datetime.utcnow(),
+    )
+    embed.add_field(name="Status", value=task.status, inline=True)
+    embed.add_field(name="Assigned To", value=assigned, inline=True)
+    embed.add_field(name="Target", value=target, inline=True)
+    embed.add_field(name="By", value=getattr(actor, "mention", str(actor)), inline=False)
+    if task.due_at:
+        embed.add_field(name="Due", value=ts_fmt(task.due_at, "R"), inline=True)
+    if action.upper() in {"COMPLETED", "DONE"} and task.completed_at:
+        embed.add_field(name="Completed", value=ts_fmt(task.completed_at, "R"), inline=True)
+    return embed
+
+
 async def call_entity_action(name: str, action: str) -> tuple[bool, str]:
     if not RUSTPLUS_API_BASE:
         return False, "RUSTPLUS_API_BASE is not set on the bot."
@@ -521,6 +565,7 @@ class TaskActionView(discord.ui.View):
         task = store.get(self.task_id)
         if interaction.guild and task:
             await update_task_message(interaction.guild, task)
+            await post_task_log(interaction.guild, build_task_log_embed(interaction.guild, task, new_status, interaction.user))
 
         await interaction.response.send_message(f"✅ Task #{self.task_id} → `{new_status}`", ephemeral=True)
 
@@ -594,6 +639,7 @@ async def set_status(interaction: discord.Interaction, task_id: int, new_status:
 
     if interaction.guild:
         await update_task_message(interaction.guild, task)
+        await post_task_log(interaction.guild, build_task_log_embed(interaction.guild, task, new_status, interaction.user))
 
     await interaction.response.send_message(f"✅ Task #{task_id} set to `{new_status}`", ephemeral=True)
 
@@ -646,7 +692,8 @@ async def task_create(
     view = TaskActionView(task.id)
     msg = await channel.send(content=assigned_role.mention, embed=embed, view=view)
     store.set_message_id(task.id, msg.id)
-    store.add_log(task.id, "CREATED", interaction.user.id, "Created via /task_create")
+    store.add_log(task.id, "POSTED", interaction.user.id, f"Posted to channel_id={TASK_CHANNEL_ID}")
+    await post_task_log(guild, build_task_log_embed(guild, task, "CREATED", interaction.user))
 
     await interaction.response.send_message(f"✅ Created Task #{task.id} in {channel.mention}", ephemeral=True)
 
@@ -721,6 +768,7 @@ async def task_assign(interaction: discord.Interaction, task_id: int, assigned_r
 
     if interaction.guild:
         await update_task_message(interaction.guild, task)
+        await post_task_log(interaction.guild, build_task_log_embed(interaction.guild, task, "REASSIGNED", interaction.user))
 
     await interaction.response.send_message(f"✅ Task #{task_id} reassigned to {assigned_role.mention}", ephemeral=True)
 
@@ -747,6 +795,7 @@ DISCORD_RECRUITING_CHANNEL = int(os.getenv("DISCORD_RECRUITING_CHANNEL", "0") or
 DISCORD_COMMAND_LOG_CHANNEL = int(os.getenv("DISCORD_COMMAND_LOG_CHANNEL", "0") or 0)
 DISCORD_ERROR_LOG_CHANNEL = int(os.getenv("DISCORD_ERROR_LOG_CHANNEL", "0") or 0)
 DUTY_STATUS_LOG_CHANNEL = int(os.getenv("DUTY_STATUS_LOG_CHANNEL", "0") or 0)
+TASK_LOG_CHANNEL_ID = int(os.getenv("TASK_LOG_CHANNEL_ID", "0") or 0)
 
 # -------------------------
 # DISCORD – ROLES
