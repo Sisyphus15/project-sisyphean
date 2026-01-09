@@ -1,0 +1,24 @@
+{
+  "panel_size": 256,
+  "crop_mode": "center_square",
+  "panel_keys": {
+    "nodes": "nodes.png",
+    "boars": "boars.png",
+    "horses": "horses.png",
+    "berries": "berries.png",
+    "hemp": "hemp.png",
+    "bears": "bears.png",
+    "nobuild": "nobuild.png"
+  },
+  "paths": {
+    "incoming_dir": "work/incoming",
+    "panels_dir": "work/panels",
+    "output_dir": "work/output"
+  },
+  "dashboard": {
+    "command": ["python3", "ingest_maps.py"],
+    "cwd": "../atlas_grid/rust-heatmap-dashboard",
+    "output_path": "../atlas_grid/rust-heatmap-dashboard/output/dashboard.png",
+    "input_dir": "../atlas_grid/rust-heatmap-dashboard/input"
+  }
+}
