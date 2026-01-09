@@ -1,0 +1,19 @@
+{
+  "panel_size": 256,
+  "grid": {
+    "columns": 4,
+    "gap": 12,
+    "padding": 24,
+    "background_color": "#0f1519"
+  },
+  "slot_order": [
+    "nodes",
+    "boars",
+    "horses",
+    "berries",
+    "hemp",
+    "bears",
+    "nobuild"
+  ],
+  "placeholder_color": "#2a3238"
+}

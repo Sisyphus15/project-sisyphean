@@ -30,6 +30,8 @@ logging.basicConfig(level=logging.INFO)
 # ---------- ENV + CONFIG + LOGGING ----------
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "sisyphus.db")  # unified DB (already used by TIME_DB_PATH)
+ATLAS_DIR = os.path.join(BASE_DIR, "atlas_grid", "rust-heatmap-dashboard")
 CONFIG_PATH = os.path.join(BASE_DIR, "rust_config.json")
 
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -92,6 +94,18 @@ tree = bot.tree  # nicer alias
 
 @bot.event
 async def setup_hook():
+    from atlas_db import init_atlas_tables
+
+    init_atlas_tables(DB_PATH)
+    bot.atlas_db_path = DB_PATH
+    bot.atlas_dir = ATLAS_DIR
+
+    try:
+        await bot.load_extension("cogs.atlas_builder")
+        logging.info("✅ Loaded cogs.atlas_builder")
+    except Exception:
+        logging.exception("❌ Failed to load cogs.atlas_builder")
+
     try:
         guild_id = int(os.getenv("DISCORD_GUILD_ID", "0") or 0) or int(os.getenv("RUST_GUILD_ID", "0") or 0)
 
@@ -1798,6 +1812,17 @@ async def time_prefix(ctx: commands.Context, *, when: str):
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    # 1) Atlas attachment intake FIRST (so it can consume image uploads)
+    try:
+        from cogs.atlas_builder import handle_atlas_attachment
+
+        consumed = await handle_atlas_attachment(message, DB_PATH, ATLAS_DIR)
+        if consumed:
+            return  # stop here; don't also treat image message as a time ping message
+    except Exception:
+        # swallow but log if you want
+        pass
 
     # allow inline trigger like: "meet me at !t 5pm"
     m = TIME_INLINE_RE.search(message.content)
